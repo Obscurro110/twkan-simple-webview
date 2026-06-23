@@ -5,6 +5,68 @@
     return;
   }
 
+  // Ad Blocker - Remove common ad elements
+  function removeAds() {
+    // Common ad selectors
+    var adSelectors = [
+      'iframe[src*="ads"]',
+      'iframe[src*="doubleclick"]',
+      'iframe[src*="googlesyndication"]',
+      'div[id*="ad"]',
+      'div[class*="ad"]',
+      'div[id*="banner"]',
+      'div[class*="banner"]',
+      'div[id*="sponsor"]',
+      'div[class*="sponsor"]',
+      'ins.adsbygoogle',
+      '[class*="advertisement"]',
+      '[id*="advertisement"]',
+      'a[href*="/ads/"]',
+      'div[style*="display: none"]'
+    ];
+
+    adSelectors.forEach(function(selector) {
+      try {
+        var elements = document.querySelectorAll(selector);
+        elements.forEach(function(el) {
+          // Check if it looks like an ad (contains ad-related text or is from ad domain)
+          var isAd = false;
+          if (el.tagName === 'IFRAME') {
+            isAd = true;
+          } else if (el.offsetHeight > 50 && el.offsetHeight < 300 && el.offsetWidth > 200) {
+            // Typical ad dimensions
+            var text = el.innerText || '';
+            if (text.match(/广告|Advertisement|赞助|Sponsored/i)) {
+              isAd = true;
+            }
+          }
+          if (isAd) {
+            el.style.display = 'none';
+            el.remove();
+          }
+        });
+      } catch (e) {
+        // Ignore selector errors
+      }
+    });
+
+    // Block ad scripts
+    var scripts = document.querySelectorAll('script[src]');
+    scripts.forEach(function(script) {
+      var src = script.src || '';
+      if (src.match(/googlesyndication|doubleclick|ads|adservice|advertising/i)) {
+        script.remove();
+      }
+    });
+  }
+
+  // Run ad blocker on page load and mutations
+  function initAdBlocker() {
+    removeAds();
+    // Run periodically to catch dynamically loaded ads
+    setInterval(removeAds, 2000);
+  }
+
   var CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;
   var SKIP_TAGS = {
     SCRIPT: true,
@@ -139,6 +201,7 @@
 
   window[runKey] = function () {
     schedule(document.body || document.documentElement);
+    initAdBlocker();
   };
 
   if (window[installedKey]) {
@@ -178,4 +241,20 @@
   });
 
   window[runKey]();
+
+  // CSS injection to hide common ad patterns
+  var style = document.createElement('style');
+  style.textContent = [
+    '[class*="ad-"] { display: none !important; }',
+    '[id*="ad-"] { display: none !important; }',
+    '[class*="advertisement"] { display: none !important; }',
+    '[id*="advertisement"] { display: none !important; }',
+    'ins.adsbygoogle { display: none !important; }',
+    'iframe[src*="ads"] { display: none !important; }',
+    'iframe[src*="doubleclick"] { display: none !important; }',
+    'iframe[src*="googlesyndication"] { display: none !important; }',
+    '[class*="banner"] { display: none !important; }',
+    '[id*="banner"] { display: none !important; }'
+  ].join('\n');
+  document.head.appendChild(style);
 }());
