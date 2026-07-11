@@ -58,7 +58,7 @@
 
   // ─── Constants ────────────────────────────────────────────────────────────
   var CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;
-  var SEP = "\u001F"; // Unit Separator – used as batch delimiter
+  var SEP = "\u001F";
   var SKIP_TAGS = {
     SCRIPT: true, STYLE: true, NOSCRIPT: true,
     TEXTAREA: true, INPUT: true, SELECT: true, OPTION: true,
@@ -66,8 +66,9 @@
   };
   var ATTRIBUTES = ["title", "aria-label", "alt", "placeholder"];
   var installedKey = "__twkanSimplifierInstalled";
-  var runKey = "__twkanSimplifierRun";
-  var converting = false;
+  var runKey       = "__twkanSimplifierRun";
+  var converting   = false;
+  var pageReadySent = false; // only notify Java once per page load
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
   function canConvertText(text) {
@@ -89,27 +90,20 @@
     return false;
   }
 
-  // ─── Batch Conversion (core optimisation) ─────────────────────────────────
-  // Collect ALL text nodes and attribute values first, join them with SEP,
-  // call the Bridge exactly ONCE, then write results back.
-  // This reduces hundreds of JS→Java round-trips to a single call.
-  function simplify(root) {
+  // ─── Batch Conversion ─────────────────────────────────────────────────────
+  function simplify(root, isFirstPass) {
     if (!root || converting) return;
     converting = true;
 
     try {
-      // 1. Collect nodes that need conversion
-      var textNodes = [];   // DOM text nodes
-      var attrNodes = [];   // { element, attrName, value }
-
-      var startNodes = (root.nodeType === Node.TEXT_NODE) ? [root] : [];
+      var textNodes = [];
+      var attrNodes = [];
 
       if (root.nodeType === Node.TEXT_NODE) {
         if (!hasSkippedParent(root) && canConvertText(root.nodeValue)) {
           textNodes.push(root);
         }
       } else {
-        // Walk the tree
         var walker = document.createTreeWalker(
           root,
           NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
@@ -130,9 +124,7 @@
         var node;
         while ((node = walker.nextNode())) {
           if (node.nodeType === Node.TEXT_NODE) {
-            if (canConvertText(node.nodeValue)) {
-              textNodes.push(node);
-            }
+            if (canConvertText(node.nodeValue)) textNodes.push(node);
           } else if (node.nodeType === Node.ELEMENT_NODE) {
             for (var a = 0; a < ATTRIBUTES.length; a++) {
               var val = node.getAttribute(ATTRIBUTES[a]);
@@ -143,38 +135,40 @@
           }
         }
 
-        // Title
         if (canConvertText(document.title)) {
           attrNodes.push({ element: null, attrName: "__title__", value: document.title });
         }
       }
 
-      // 2. Build a single batch string
       var allValues = [];
       for (var i = 0; i < textNodes.length; i++) allValues.push(textNodes[i].nodeValue);
       for (var j = 0; j < attrNodes.length; j++) allValues.push(attrNodes[j].value);
 
-      if (allValues.length === 0) return;
-
-      var batchInput = allValues.join(SEP);
-
-      // 3. Single Bridge call (use batch API if available, fall back to single)
-      var batchOutput;
-      try {
-        if (typeof window.TwkanBridge.toBatchSimplified === "function") {
-          batchOutput = window.TwkanBridge.toBatchSimplified(batchInput);
-        } else {
-          // Fallback: old single-call API
-          batchOutput = window.TwkanBridge.toSimplified(batchInput);
-        }
-      } catch (e) {
+      if (allValues.length === 0) {
+        // Nothing to convert – page is ready
+        if (isFirstPass) notifyPageReady();
         return;
       }
 
-      if (!batchOutput) return;
+      var batchOutput;
+      try {
+        if (typeof window.TwkanBridge.toBatchSimplified === "function") {
+          batchOutput = window.TwkanBridge.toBatchSimplified(allValues.join(SEP));
+        } else {
+          batchOutput = window.TwkanBridge.toSimplified(allValues.join(SEP));
+        }
+      } catch (e) {
+        if (isFirstPass) notifyPageReady();
+        return;
+      }
+
+      if (!batchOutput) {
+        if (isFirstPass) notifyPageReady();
+        return;
+      }
+
       var results = batchOutput.split(SEP);
 
-      // 4. Write results back
       for (var ti = 0; ti < textNodes.length; ti++) {
         var converted = results[ti];
         if (converted !== undefined && converted !== textNodes[ti].nodeValue) {
@@ -195,34 +189,46 @@
 
       document.documentElement.setAttribute("lang", "zh-Hans");
 
+      // Tell Java the first pass is done → show the WebView
+      if (isFirstPass) notifyPageReady();
+
     } finally {
       converting = false;
     }
   }
 
+  function notifyPageReady() {
+    if (pageReadySent) return;
+    pageReadySent = true;
+    try {
+      if (typeof window.TwkanBridge.onPageReady === "function") {
+        window.TwkanBridge.onPageReady();
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   // ─── Debounced scheduler ──────────────────────────────────────────────────
-  function schedule(root) {
+  function schedule(root, isFirstPass) {
     window.clearTimeout(schedule.timer);
-    schedule.target = root || document.body || document.documentElement;
+    schedule.pendingRoot = root || document.body || document.documentElement;
+    schedule.pendingFirst = isFirstPass;
     schedule.timer = window.setTimeout(function () {
-      simplify(schedule.target);
+      simplify(schedule.pendingRoot, schedule.pendingFirst);
     }, 60);
   }
 
-  // ─── Public run entry ─────────────────────────────────────────────────────
-  // ─── Chapter Preloader ──────────────────────────────────────────────────
-  // After the page settles, silently fetch the next PREFETCH_AHEAD chapters
-  // into the browser cache so navigating to them feels instant.
+  // ─── Chapter Preloader ────────────────────────────────────────────────────
   var PREFETCH_AHEAD = 3;
-  var prefetchedUrls = new Set ? new Set() : {};  // graceful fallback
-  var prefetchedHas = prefetchedUrls.has
-    ? function(u) { return prefetchedUrls.has(u); }
-    : function(u) { return !!prefetchedUrls[u]; };
-  var prefetchedAdd = prefetchedUrls.add
-    ? function(u) { prefetchedUrls.add(u); }
-    : function(u) { prefetchedUrls[u] = true; };
+  // Fix: use typeof check, not truthiness of the Set constructor itself
+  var prefetchedUrls = (typeof Set !== "undefined") ? new Set() : null;
 
-  /** Find the "next chapter" href from a document (main or parsed). */
+  function prefetchedHas(u) {
+    return prefetchedUrls ? prefetchedUrls.has(u) : false;
+  }
+  function prefetchedAdd(u) {
+    if (prefetchedUrls) prefetchedUrls.add(u);
+  }
+
   function findNextChapterUrl(doc) {
     var links = doc.querySelectorAll("a[href]");
     for (var i = 0; i < links.length; i++) {
@@ -231,14 +237,12 @@
       var rel  = (a.getAttribute("rel") || "").toLowerCase();
       var href = a.href || a.getAttribute("href") || "";
       if (!href || href === window.location.href) continue;
-      // Match "下一章/话/节/篇/頁" or rel=next or english variants
       if (
-        text.match(/下一[章话節节篇頁页]/) ||
+        text.match(/下一[章话話節节篇頁页集]/) ||
         rel === "next" ||
         text.match(/next\s*chap/i) ||
         (a.getAttribute("title") || "").match(/下一/)
       ) {
-        // Make absolute if necessary
         if (href.charAt(0) === "/") {
           href = window.location.protocol + "//" + window.location.host + href;
         }
@@ -248,49 +252,41 @@
     return null;
   }
 
-  /**
-   * Fetch url into cache, then (if depth > 1) parse the response to find
-   * and fetch the chapter after that, recursively up to PREFETCH_AHEAD times.
-   */
   function prefetchChain(url, depth) {
     if (!url || depth <= 0 || prefetchedHas(url)) return;
     prefetchedAdd(url);
     fetch(url, {
-      credentials: "include",   // send cookies so paid chapters work
-      cache: "force-cache",     // use cache if already fresh, otherwise network
-      headers: { "X-Purpose": "prefetch" }
+      credentials: "include",
+      cache: "force-cache"
     })
-      .then(function(res) {
+      .then(function (res) {
         if (!res.ok || depth <= 1) return null;
         return res.text();
       })
-      .then(function(html) {
+      .then(function (html) {
         if (!html) return;
         try {
           var parser = new DOMParser();
           var doc = parser.parseFromString(html, "text/html");
           var nextUrl = findNextChapterUrl(doc);
-          if (nextUrl) {
-            prefetchChain(nextUrl, depth - 1);
-          }
-        } catch (e) { /* ignore parse errors */ }
+          if (nextUrl) prefetchChain(nextUrl, depth - 1);
+        } catch (e) { /* ignore */ }
       })
-      .catch(function() { /* network errors are non-fatal */ });
+      .catch(function () { /* non-fatal */ });
   }
 
   function initPreloader() {
-    // Delay so prefetch traffic doesn't compete with the page's own resources
-    setTimeout(function() {
+    // Wait 2s so prefetch doesn't compete with the current page's own requests
+    setTimeout(function () {
       var nextUrl = findNextChapterUrl(document);
-      if (nextUrl) {
-        prefetchChain(nextUrl, PREFETCH_AHEAD);
-      }
+      if (nextUrl) prefetchChain(nextUrl, PREFETCH_AHEAD);
     }, 2000);
   }
-  // ─────────────────────────────────────────────────────────────────────────
 
+  // ─── Public run entry ─────────────────────────────────────────────────────
   window[runKey] = function () {
-    schedule(document.body || document.documentElement);
+    pageReadySent = false; // reset for each new page
+    schedule(document.body || document.documentElement, true /* isFirstPass */);
     initAdBlocker();
     initPreloader();
   };
@@ -301,13 +297,13 @@
   }
   window[installedKey] = true;
 
-  // ─── MutationObserver ────────────────────────────────────────────────────
+  // ─── MutationObserver (subsequent updates, not first pass) ────────────────
   var observer = new MutationObserver(function (mutations) {
     if (converting) return;
     for (var i = 0; i < mutations.length; i++) {
       var m = mutations[i];
       if (m.type === "characterData" || m.type === "attributes" || m.addedNodes.length > 0) {
-        schedule(document.body || document.documentElement);
+        schedule(document.body || document.documentElement, false);
         return;
       }
     }

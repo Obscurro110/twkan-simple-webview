@@ -4,10 +4,13 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.icu.text.Transliterator;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -32,10 +35,14 @@ public class MainActivity extends Activity {
     private static final String TAG = "TwkanSimple";
     private static final String HOME_URL = "https://twkan.com/";
     private static final String SIMPLIFY_BRIDGE_NAME = "TwkanBridge";
+    // Max ms to wait for simplification before showing page anyway
+    private static final int SHOW_TIMEOUT_MS = 1500;
 
     private WebView webView;
     private ProgressBar progressBar;
     private String simplifierScript;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable showPageRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -121,10 +128,35 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                // Hide the WebView immediately when a new page starts loading
+                // so the user never sees raw traditional Chinese text flash.
+                if (isTwkanHost(Uri.parse(url).getHost())) {
+                    webView.setVisibility(View.INVISIBLE);
+                    // Safety timeout: always show after 1.5s even if JS didn't call back
+                    cancelShowTimeout();
+                    showPageRunnable = () -> showWebView();
+                    mainHandler.postDelayed(showPageRunnable, SHOW_TIMEOUT_MS);
+                }
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 injectSimplifier(url);
             }
         });
+    }
+
+    private void cancelShowTimeout() {
+        if (showPageRunnable != null) {
+            mainHandler.removeCallbacks(showPageRunnable);
+            showPageRunnable = null;
+        }
+    }
+
+    private void showWebView() {
+        cancelShowTimeout();
+        webView.setVisibility(View.VISIBLE);
     }
 
     private boolean handleNavigation(Uri uri) {
@@ -229,11 +261,17 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    public static final class SimplifyBridge {
+    public final class SimplifyBridge {
         private final Transliterator transliterator;
 
         public SimplifyBridge() {
             transliterator = Transliterator.getInstance("Traditional-Simplified");
+        }
+
+        /** JS calls this once the first simplification pass is complete. */
+        @JavascriptInterface
+        public void onPageReady() {
+            mainHandler.post(() -> showWebView());
         }
 
         @JavascriptInterface
@@ -249,14 +287,12 @@ public class MainActivity extends Activity {
         /**
          * Batch convert multiple strings in a single Bridge call.
          * Input/output: strings joined by the Unit Separator character (U+001F).
-         * This is far faster than calling toSimplified() once per text node.
          */
         @JavascriptInterface
         public String toBatchSimplified(String input) {
             if (input == null || input.isEmpty()) {
                 return input;
             }
-            // U+001F = Unit Separator, used as delimiter
             String[] parts = input.split("\u001F", -1);
             StringBuilder result = new StringBuilder(input.length());
             synchronized (transliterator) {
