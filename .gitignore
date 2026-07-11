@@ -39,6 +39,8 @@ output.json
 # Keystore files
 *.jks
 *.keystore
+# Allow the fixed release keystore used for consistent signing
+!app/twkan-release.keystore
 
 # Google Services
 google-services.json

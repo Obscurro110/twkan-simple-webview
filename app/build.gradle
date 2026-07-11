@@ -14,9 +14,24 @@ android {
         versionName "1.0.0"
     }
 
+    signingConfigs {
+        release {
+            storeFile file("twkan-release.keystore")
+            storePassword "twkan123"
+            keyAlias "twkan"
+            keyPassword "twkan123"
+        }
+    }
+
     buildTypes {
+        debug {
+            // Use the same release signing so every build has an identical signature.
+            // This allows direct APK updates without uninstalling.
+            signingConfig signingConfigs.release
+        }
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
     }
 

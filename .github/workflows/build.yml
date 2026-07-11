@@ -27,22 +27,17 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Debug APK
-      run: ./gradlew assembleDebug --stacktrace
+    - name: Build APK (signed with fixed keystore)
+      run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-    - name: Upload APK
+    - name: Upload Debug APK
       uses: actions/upload-artifact@v4
       with:
         name: app-debug
         path: app/build/outputs/apk/debug/app-debug.apk
 
-    - name: Build Release APK (unsigned)
-      run: ./gradlew assembleRelease --stacktrace
-      continue-on-error: true
-
     - name: Upload Release APK
       uses: actions/upload-artifact@v4
-      if: success()
       with:
-        name: app-release-unsigned
-        path: app/build/outputs/apk/release/app-release-unsigned.apk
+        name: app-release
+        path: app/build/outputs/apk/release/app-release.apk
