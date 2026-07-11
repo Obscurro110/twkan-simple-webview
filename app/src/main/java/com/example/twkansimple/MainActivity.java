@@ -245,5 +245,28 @@ public class MainActivity extends Activity {
                 return transliterator.transliterate(text);
             }
         }
+
+        /**
+         * Batch convert multiple strings in a single Bridge call.
+         * Input/output: strings joined by the Unit Separator character (U+001F).
+         * This is far faster than calling toSimplified() once per text node.
+         */
+        @JavascriptInterface
+        public String toBatchSimplified(String input) {
+            if (input == null || input.isEmpty()) {
+                return input;
+            }
+            // U+001F = Unit Separator, used as delimiter
+            String[] parts = input.split("\u001F", -1);
+            StringBuilder result = new StringBuilder(input.length());
+            synchronized (transliterator) {
+                for (int i = 0; i < parts.length; i++) {
+                    if (i > 0) result.append('\u001F');
+                    String part = parts[i];
+                    result.append(part.isEmpty() ? part : transliterator.transliterate(part));
+                }
+            }
+            return result.toString();
+        }
     }
 }
