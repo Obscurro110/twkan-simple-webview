@@ -210,9 +210,89 @@
   }
 
   // ─── Public run entry ─────────────────────────────────────────────────────
+  // ─── Chapter Preloader ──────────────────────────────────────────────────
+  // After the page settles, silently fetch the next PREFETCH_AHEAD chapters
+  // into the browser cache so navigating to them feels instant.
+  var PREFETCH_AHEAD = 3;
+  var prefetchedUrls = new Set ? new Set() : {};  // graceful fallback
+  var prefetchedHas = prefetchedUrls.has
+    ? function(u) { return prefetchedUrls.has(u); }
+    : function(u) { return !!prefetchedUrls[u]; };
+  var prefetchedAdd = prefetchedUrls.add
+    ? function(u) { prefetchedUrls.add(u); }
+    : function(u) { prefetchedUrls[u] = true; };
+
+  /** Find the "next chapter" href from a document (main or parsed). */
+  function findNextChapterUrl(doc) {
+    var links = doc.querySelectorAll("a[href]");
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      var text = (a.textContent || a.innerText || "").trim();
+      var rel  = (a.getAttribute("rel") || "").toLowerCase();
+      var href = a.href || a.getAttribute("href") || "";
+      if (!href || href === window.location.href) continue;
+      // Match "下一章/话/节/篇/頁" or rel=next or english variants
+      if (
+        text.match(/下一[章话節节篇頁页]/) ||
+        rel === "next" ||
+        text.match(/next\s*chap/i) ||
+        (a.getAttribute("title") || "").match(/下一/)
+      ) {
+        // Make absolute if necessary
+        if (href.charAt(0) === "/") {
+          href = window.location.protocol + "//" + window.location.host + href;
+        }
+        return href;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Fetch url into cache, then (if depth > 1) parse the response to find
+   * and fetch the chapter after that, recursively up to PREFETCH_AHEAD times.
+   */
+  function prefetchChain(url, depth) {
+    if (!url || depth <= 0 || prefetchedHas(url)) return;
+    prefetchedAdd(url);
+    fetch(url, {
+      credentials: "include",   // send cookies so paid chapters work
+      cache: "force-cache",     // use cache if already fresh, otherwise network
+      headers: { "X-Purpose": "prefetch" }
+    })
+      .then(function(res) {
+        if (!res.ok || depth <= 1) return null;
+        return res.text();
+      })
+      .then(function(html) {
+        if (!html) return;
+        try {
+          var parser = new DOMParser();
+          var doc = parser.parseFromString(html, "text/html");
+          var nextUrl = findNextChapterUrl(doc);
+          if (nextUrl) {
+            prefetchChain(nextUrl, depth - 1);
+          }
+        } catch (e) { /* ignore parse errors */ }
+      })
+      .catch(function() { /* network errors are non-fatal */ });
+  }
+
+  function initPreloader() {
+    // Delay so prefetch traffic doesn't compete with the page's own resources
+    setTimeout(function() {
+      var nextUrl = findNextChapterUrl(document);
+      if (nextUrl) {
+        prefetchChain(nextUrl, PREFETCH_AHEAD);
+      }
+    }, 2000);
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   window[runKey] = function () {
     schedule(document.body || document.documentElement);
     initAdBlocker();
+    initPreloader();
   };
 
   if (window[installedKey]) {
