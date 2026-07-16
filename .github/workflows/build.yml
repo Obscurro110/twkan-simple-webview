@@ -33,9 +33,12 @@ jobs:
     - name: Build APK (signed with fixed keystore)
       run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-    - name: Get short commit SHA
-      id: sha
-      run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+    - name: Get version info
+      id: ver
+      run: |
+        echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "code=$(git rev-list --count HEAD)" >> $GITHUB_OUTPUT
+        echo "name=1.0.$(date +%Y%m%d)-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     - name: Delete previous 'latest' release if exists
       if: github.event_name == 'push'
@@ -50,11 +53,13 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: latest
-        name: "Latest Build (${{ steps.sha.outputs.short }})"
+        name: "v${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})"
         body: |
-          自动构建版本，commit: ${{ steps.sha.outputs.short }}
+          **版本：** `${{ steps.ver.outputs.name }}`
+          **构建号：** `${{ steps.ver.outputs.code }}`
+          **Commit：** `${{ steps.ver.outputs.short }}`
 
-          **直接下载 APK 安装即可，无需卸载旧版本。**
+          直接下载 APK 安装即可，无需卸载旧版本。
         files: |
           app/build/outputs/apk/debug/app-debug.apk
           app/build/outputs/apk/release/app-release.apk
