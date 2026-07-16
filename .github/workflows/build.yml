@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # required to create releases
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,14 +33,37 @@ jobs:
     - name: Build APK (signed with fixed keystore)
       run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-    - name: Upload Debug APK
+    - name: Get short commit SHA
+      id: sha
+      run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Delete previous 'latest' release if exists
+      if: github.event_name == 'push'
+      run: |
+        gh release delete latest --yes 2>/dev/null || true
+        git push origin :refs/tags/latest 2>/dev/null || true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create GitHub Release with APK
+      if: github.event_name == 'push'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: "Latest Build (${{ steps.sha.outputs.short }})"
+        body: |
+          自动构建版本，commit: ${{ steps.sha.outputs.short }}
+
+          **直接下载 APK 安装即可，无需卸载旧版本。**
+        files: |
+          app/build/outputs/apk/debug/app-debug.apk
+          app/build/outputs/apk/release/app-release.apk
+        make_latest: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Debug APK (artifact backup)
       uses: actions/upload-artifact@v4
       with:
         name: app-debug
         path: app/build/outputs/apk/debug/app-debug.apk
-
-    - name: Upload Release APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-release
-        path: app/build/outputs/apk/release/app-release.apk
