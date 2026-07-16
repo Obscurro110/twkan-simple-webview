@@ -18,6 +18,7 @@ import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -29,14 +30,68 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 public class MainActivity extends Activity {
     private static final String TAG = "TwkanSimple";
     private static final String HOME_URL = "https://twkan.com/";
     private static final String SIMPLIFY_BRIDGE_NAME = "TwkanBridge";
-    // Max ms to wait for simplification before showing page anyway
     private static final int SHOW_TIMEOUT_MS = 1500;
+
+    /** Ad/tracker domains to block at the network layer. */
+    private static final Set<String> AD_HOSTS = new HashSet<>(Arrays.asList(
+            "googlesyndication.com",
+            "doubleclick.net",
+            "googleadservices.com",
+            "google-analytics.com",
+            "googletagmanager.com",
+            "googletagservices.com",
+            "adservice.google.com",
+            "adservice.google.com.tw",
+            "adservice.google.com.hk",
+            "pagead2.googlesyndication.com",
+            "tpc.googlesyndication.com",
+            "ads.google.com",
+            "adnxs.com",
+            "facebook.com/tr",
+            "connect.facebook.net",
+            "scorecardresearch.com",
+            "quantserve.com",
+            "outbrain.com",
+            "taboola.com",
+            "criteo.com",
+            "amazon-adsystem.com",
+            "adsafeprotected.com",
+            "moatads.com"
+    ));
+
+    /** Empty 1×1 transparent GIF returned for blocked image requests. */
+    private static final byte[] EMPTY_GIF = {
+        0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,(byte)0x80,
+        0x00,0x00,(byte)0xff,(byte)0xff,(byte)0xff,0x00,0x00,0x00,0x21,
+        (byte)0xf9,0x04,0x00,0x00,0x00,0x00,0x00,0x2c,0x00,0x00,0x00,
+        0x00,0x01,0x00,0x01,0x00,0x00,0x02,0x02,0x44,0x01,0x00,0x3b
+    };
+
+    private static boolean isAdUrl(String url) {
+        if (url == null) return false;
+        try {
+            String host = Uri.parse(url).getHost();
+            if (host == null) return false;
+            host = host.toLowerCase(Locale.ROOT);
+            for (String adHost : AD_HOSTS) {
+                if (host.equals(adHost) || host.endsWith("." + adHost)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            // ignore malformed URLs
+        }
+        return false;
+    }
 
     private WebView webView;
     private ProgressBar progressBar;
@@ -114,6 +169,22 @@ public class MainActivity extends Activity {
             }
         });
         webView.setWebViewClient(new WebViewClient() {
+
+            // ── Network-level ad blocker ──────────────────────────────────
+            @Override
+            public WebResourceResponse shouldInterceptRequest(
+                    WebView view, WebResourceRequest request) {
+                String url = request.getUrl() != null
+                        ? request.getUrl().toString() : null;
+                if (isAdUrl(url)) {
+                    // Return empty response instead of the ad resource
+                    return new WebResourceResponse(
+                            "text/plain", "UTF-8",
+                            new java.io.ByteArrayInputStream(new byte[0]));
+                }
+                return null; // let WebView handle normally
+            }
+            // ─────────────────────────────────────────────────────────────
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (!request.isForMainFrame()) {
