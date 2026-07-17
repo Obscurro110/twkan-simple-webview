@@ -232,6 +232,10 @@
   var nextChapterUrl = null;
   var appendingChapter = false;
   var noMoreChapters = false;
+  var initialChapterUrl = null;
+  var initialChapterTitle = null;
+  var currentReadingUrl = null;
+  var readingTrackerTimer = null;
 
   var CONTENT_SELECTORS = [
     "#chaptercontent", "#chapter-content", "#chapterContent",
@@ -488,6 +492,90 @@
     loadingIndicator.style.display = text ? "block" : "none";
   }
 
+  function persistLocalReadingProgress(url, title) {
+    var progress = {
+      url: url,
+      title: title || "",
+      updatedAt: Date.now()
+    };
+    var serialized = JSON.stringify(progress);
+    try { localStorage.setItem("twkan:lastReadingProgress", serialized); } catch (e) { /* ignore */ }
+    try { sessionStorage.setItem("twkan:lastReadingProgress", serialized); } catch (e) { /* ignore */ }
+  }
+
+  function notifyWebsiteChapterChange(url, title) {
+    var detail = { url: url, title: title || "", source: "twkan-infinite-reader" };
+    try {
+      window.dispatchEvent(new CustomEvent("twkan:chapterchange", { detail: detail }));
+      document.dispatchEvent(new CustomEvent("chapterchange", { detail: detail }));
+    } catch (e) { /* old WebView fallback */ }
+
+    // Ask Android to open this chapter once in a hidden, cookie-sharing WebView.
+    // That executes the site's own read-history script without leaving the
+    // infinite reader. It is called only when the chapter is actually read.
+    try {
+      if (typeof window.TwkanBridge.syncReadingRecord === "function") {
+        window.TwkanBridge.syncReadingRecord(url);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function activateReadingChapter(element, force) {
+    if (!element) return;
+    var url = normalizeUrl(element.getAttribute("data-chapter-url"));
+    if (!url || (!force && url === currentReadingUrl)) return;
+    var title = element.getAttribute("data-chapter-title") || initialChapterTitle || document.title;
+
+    currentReadingUrl = url;
+    persistLocalReadingProgress(url, title);
+
+    try {
+      var oldState = history.state && typeof history.state === "object" ? history.state : {};
+      var nextState = {};
+      for (var key in oldState) {
+        if (Object.prototype.hasOwnProperty.call(oldState, key)) nextState[key] = oldState[key];
+      }
+      nextState.twkanInfiniteReader = true;
+      nextState.twkanChapterUrl = url;
+      history.replaceState(nextState, title || document.title, url);
+    } catch (e) { /* URL update is best-effort */ }
+
+    if (title) document.title = title;
+    document.documentElement.setAttribute("data-current-chapter-url", url);
+
+    // The initial page records itself during normal navigation. Returning to it
+    // later should still update the record, so notify on every chapter change.
+    notifyWebsiteChapterChange(url, title);
+  }
+
+  function updateVisibleReadingChapter() {
+    if (!infiniteInitialized) return;
+    var chapters = document.querySelectorAll("[data-twkan-reading-chapter='true']");
+    if (!chapters.length) return;
+    var readingLine = Math.max(120, window.innerHeight * 0.35);
+    var active = chapters[0];
+
+    for (var i = 0; i < chapters.length; i++) {
+      var rect = chapters[i].getBoundingClientRect();
+      if (rect.top <= readingLine) active = chapters[i];
+      if (rect.top <= readingLine && rect.bottom > readingLine) {
+        active = chapters[i];
+        break;
+      }
+      if (rect.top > readingLine) break;
+    }
+    activateReadingChapter(active, false);
+  }
+
+  function scheduleReadingTracker() {
+    if (readingTrackerTimer !== null) return;
+    readingTrackerTimer = window.requestAnimationFrame(function () {
+      readingTrackerTimer = null;
+      updateVisibleReadingChapter();
+    });
+  }
+
+
   function appendNextChapter() {
     if (appendingChapter || noMoreChapters || !nextChapterUrl || !infiniteHost) {
       return Promise.resolve(null);
@@ -507,7 +595,9 @@
         var section = document.createElement("section");
         section.className = "twkan-infinite-chapter";
         section.setAttribute("data-twkan-infinite-managed", "true");
+        section.setAttribute("data-twkan-reading-chapter", "true");
         section.setAttribute("data-chapter-url", chapter.url);
+        section.setAttribute("data-chapter-title", chapter.title || "");
 
         var separator = document.createElement("div");
         separator.className = "twkan-chapter-separator";
@@ -568,8 +658,18 @@
     if (!isLikelyChapterPage(document, contentRoot, nextInfo)) return;
 
     infiniteInitialized = true;
+    initialChapterUrl = normalizeUrl(sourceUrlFor(document));
+    initialChapterTitle = getChapterTitle(document, contentRoot) || document.title;
+    currentReadingUrl = initialChapterUrl;
     nextChapterUrl = normalizeUrl(nextInfo.url);
-    appendedUrls[normalizeUrl(window.location.href)] = true;
+    appendedUrls[initialChapterUrl] = true;
+
+    // Treat the original chapter as the first tracked section. Its URL remains
+    // the real network URL even after history.replaceState changes location.
+    contentRoot.setAttribute("data-twkan-reading-chapter", "true");
+    contentRoot.setAttribute("data-chapter-url", initialChapterUrl);
+    contentRoot.setAttribute("data-chapter-title", initialChapterTitle || "");
+    persistLocalReadingProgress(initialChapterUrl, initialChapterTitle);
 
     infiniteHost = document.createElement("div");
     infiniteHost.className = "twkan-infinite-host";
@@ -630,6 +730,14 @@
 
     // Fill the 3-chapter memory cache immediately; append only near the bottom.
     prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
+
+
+    window.addEventListener("scroll", scheduleReadingTracker, { passive: true });
+    window.addEventListener("resize", scheduleReadingTracker, { passive: true });
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) scheduleReadingTracker();
+    });
+    scheduleReadingTracker();
   }
 
   // ─── Public run entry ─────────────────────────────────────────────────────
