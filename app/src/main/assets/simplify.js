@@ -211,84 +211,433 @@
   function schedule(root, isFirstPass) {
     window.clearTimeout(schedule.timer);
     schedule.pendingRoot = root || document.body || document.documentElement;
-    schedule.pendingFirst = isFirstPass;
+    // A mutation caused by script/style injection must not cancel the initial
+    // pass, otherwise Java waits for the safety timeout before showing the page.
+    schedule.pendingFirst = schedule.pendingFirst === true || isFirstPass === true;
     schedule.timer = window.setTimeout(function () {
-      simplify(schedule.pendingRoot, schedule.pendingFirst);
+      var firstPass = schedule.pendingFirst === true;
+      schedule.pendingFirst = false;
+      simplify(schedule.pendingRoot, firstPass);
     }, 60);
   }
 
-  // ─── Chapter Preloader ────────────────────────────────────────────────────
+  // ─── Infinite Chapter Reader + 3-chapter memory prefetch ──────────────────
   var PREFETCH_AHEAD = 3;
-  // Fix: use typeof check, not truthiness of the Set constructor itself
-  var prefetchedUrls = (typeof Set !== "undefined") ? new Set() : null;
+  var chapterCache = Object.create(null);
+  var chapterRequests = Object.create(null);
+  var appendedUrls = Object.create(null);
+  var infiniteInitialized = false;
+  var infiniteHost = null;
+  var loadingIndicator = null;
+  var nextChapterUrl = null;
+  var appendingChapter = false;
+  var noMoreChapters = false;
 
-  function prefetchedHas(u) {
-    return prefetchedUrls ? prefetchedUrls.has(u) : false;
-  }
-  function prefetchedAdd(u) {
-    if (prefetchedUrls) prefetchedUrls.add(u);
+  var CONTENT_SELECTORS = [
+    "#chaptercontent", "#chapter-content", "#chapterContent",
+    "#content", "#BookText", "#booktext",
+    ".chapter-content", ".chapterContent", ".read-content",
+    ".reading-content", ".article-content", ".novel-content",
+    ".book-content", ".entry-content", ".contentbox", ".txtnav",
+    "article"
+  ];
+
+  function resolveUrl(raw, baseUrl) {
+    if (!raw) return null;
+    try {
+      return new URL(raw, baseUrl || window.location.href).href.split("#")[0];
+    } catch (e) {
+      var helper = document.createElement("a");
+      helper.href = raw;
+      return helper.href ? helper.href.split("#")[0] : null;
+    }
   }
 
-  function findNextChapterUrl(doc) {
+  function normalizeUrl(url) {
+    var result = resolveUrl(url, window.location.href);
+    if (!result) return null;
+    return result.replace(/\/$/, "");
+  }
+
+  function sourceUrlFor(doc) {
+    return doc.__twkanSourceUrl || window.location.href;
+  }
+
+  /** Locate the most likely "next chapter" link and resolve it absolutely. */
+  function findNextChapter(doc) {
     var links = doc.querySelectorAll("a[href]");
+    var baseUrl = sourceUrlFor(doc);
+    var best = null;
+    var bestScore = -1;
+
     for (var i = 0; i < links.length; i++) {
       var a = links[i];
-      var text = (a.textContent || a.innerText || "").trim();
-      var rel  = (a.getAttribute("rel") || "").toLowerCase();
-      var href = a.href || a.getAttribute("href") || "";
-      if (!href || href === window.location.href) continue;
-      if (
-        text.match(/下一[章话話節节篇頁页集]/) ||
-        rel === "next" ||
-        text.match(/next\s*chap/i) ||
-        (a.getAttribute("title") || "").match(/下一/)
-      ) {
-        if (href.charAt(0) === "/") {
-          href = window.location.protocol + "//" + window.location.host + href;
-        }
-        return href;
+      var text = (a.textContent || "").replace(/\s+/g, "").trim();
+      var title = (a.getAttribute("title") || "").replace(/\s+/g, "").trim();
+      var rel = (a.getAttribute("rel") || "").toLowerCase();
+      var marker = ((a.id || "") + " " + (a.className || "")).toLowerCase();
+      var rawHref = a.getAttribute("href");
+      var href = resolveUrl(rawHref, baseUrl);
+      if (!href || !/^https?:/i.test(href)) continue;
+      if (/上一|返回|目录|書目|书目/.test(text)) continue;
+
+      var score = 0;
+      if (/^下一[章话話節节篇頁页集卷]$/.test(text)) score += 100;
+      else if (/下一[章话話節节篇頁页集卷]/.test(text)) score += 80;
+      if (/next\s*chap/i.test(text) || /^next$/i.test(text)) score += 70;
+      if (rel === "next") score += 60;
+      if (/(^|[-_])next($|[-_])|nextchapter|chapter-next/.test(marker)) score += 45;
+      if (/下一/.test(title)) score += 35;
+      if (href === window.location.href) score = -1;
+
+      if (score > bestScore && score > 0) {
+        bestScore = score;
+        best = { url: href.split("#")[0], element: a, text: text, score: score };
       }
     }
-    return null;
+    return best;
+  }
+
+  function findContentRoot(doc) {
+    var i;
+    for (i = 0; i < CONTENT_SELECTORS.length; i++) {
+      var matches = doc.querySelectorAll(CONTENT_SELECTORS[i]);
+      for (var m = 0; m < matches.length; m++) {
+        var directText = (matches[m].textContent || "").replace(/\s+/g, "");
+        if (directText.length >= 350) return matches[m];
+      }
+    }
+
+    // Fallback for unknown layouts: choose the large, text-dense block with
+    // few links. This keeps the feature resilient if the site changes CSS.
+    var candidates = doc.querySelectorAll("main, article, section, div");
+    var best = null;
+    var bestScore = 0;
+    for (i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      var marker = ((el.id || "") + " " + (el.className || "")).toLowerCase();
+      if (/nav|menu|header|footer|sidebar|catalog|list|comment|recommend|search|pager|pagination|breadcrumb|toolbar|advert/.test(marker)) {
+        continue;
+      }
+      var text = (el.textContent || "").replace(/\s+/g, "");
+      if (text.length < 500) continue;
+      var linkText = "";
+      var elementLinks = el.querySelectorAll("a");
+      for (var l = 0; l < elementLinks.length; l++) {
+        linkText += elementLinks[l].textContent || "";
+      }
+      var linkRatio = linkText.replace(/\s+/g, "").length / text.length;
+      if (linkRatio > 0.35) continue;
+      var paragraphs = el.querySelectorAll("p").length;
+      var breaks = el.querySelectorAll("br").length;
+      var score = Math.min(text.length, 30000) + paragraphs * 100 + breaks * 20 - linkRatio * text.length * 2;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    return best;
+  }
+
+  function getChapterTitle(doc, contentRoot) {
+    var selectors = [
+      ".chapter-title", ".chaptername", ".chapter-name",
+      ".article-title", ".entry-title", "h1", "h2"
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var heading = doc.querySelector(selectors[i]);
+      if (heading) {
+        var value = (heading.textContent || "").replace(/\s+/g, " ").trim();
+        if (value && value.length <= 160) return value;
+      }
+    }
+    var title = (doc.title || "").replace(/\s+/g, " ").trim();
+    if (title) {
+      return title.split(/[-_|｜]/)[0].trim();
+    }
+    var start = (contentRoot.textContent || "").replace(/\s+/g, " ").trim();
+    return start.substring(0, 60);
+  }
+
+  function isLikelyChapterPage(doc, contentRoot, nextInfo) {
+    if (!contentRoot) return false;
+    var text = (contentRoot.textContent || "").replace(/\s+/g, "");
+    if (text.length < 500) return false;
+    var heading = getChapterTitle(doc, contentRoot);
+    var chapterSignal = /第.{0,12}[章话話節节篇頁页集卷回]/.test(heading) ||
+      (nextInfo && /下一[章话話節节篇集卷回]/.test(nextInfo.text)) ||
+      /chapter|read|novel|book/i.test(sourceUrlFor(doc));
+    var paragraphSignal = contentRoot.querySelectorAll("p").length >= 3 ||
+      contentRoot.querySelectorAll("br").length >= 5;
+    return chapterSignal && paragraphSignal;
+  }
+
+  function sanitizeChapterContent(root, baseUrl) {
+    var unwanted = root.querySelectorAll(
+      "script, style, noscript, iframe, object, embed, form, nav, " +
+      ".adsbygoogle, .advertisement, .google-auto-placed, " +
+      "[id^='google_ads'], [id*='ad-container'], [class*='ad-container'], " +
+      ".pagination, .pager, .page-nav, .chapter-nav, .read-nav, " +
+      ".breadcrumb, .comments, .comment, .recommend, .related"
+    );
+    for (var i = unwanted.length - 1; i >= 0; i--) unwanted[i].remove();
+
+    var all = root.querySelectorAll("*");
+    for (i = 0; i < all.length; i++) {
+      var el = all[i];
+      // Remove inline event handlers from fetched HTML.
+      var attrs = Array.prototype.slice.call(el.attributes || []);
+      for (var a = 0; a < attrs.length; a++) {
+        if (/^on/i.test(attrs[a].name)) el.removeAttribute(attrs[a].name);
+      }
+
+      var urlAttrs = ["href", "src", "poster", "data-src", "data-original"];
+      for (a = 0; a < urlAttrs.length; a++) {
+        var attrName = urlAttrs[a];
+        var raw = el.getAttribute(attrName);
+        if (raw && !/^(data:|javascript:|mailto:|tel:)/i.test(raw)) {
+          var absolute = resolveUrl(raw, baseUrl);
+          if (absolute) el.setAttribute(attrName, absolute);
+        }
+      }
+    }
+
+    // Remove compact previous/index/next navigation rows that were nested in
+    // the selected content container.
+    var navLinks = root.querySelectorAll("a[href]");
+    for (i = navLinks.length - 1; i >= 0; i--) {
+      var navText = (navLinks[i].textContent || "").replace(/\s+/g, "");
+      if (/^(上一|下一|返回|目录|目錄).{0,8}$/.test(navText)) {
+        var holder = navLinks[i].closest("p, nav, .pager, .pagination, .chapter-nav, .page-nav");
+        if (holder && (holder.textContent || "").length < 250) holder.remove();
+      }
+    }
+    return root;
+  }
+
+  function extractChapter(doc, url) {
+    var nextInfo = findNextChapter(doc);
+    var root = findContentRoot(doc);
+    if (!root || !isLikelyChapterPage(doc, root, nextInfo)) {
+      throw new Error("Not a recognizable chapter page");
+    }
+    var title = getChapterTitle(doc, root);
+    var clone = sanitizeChapterContent(root.cloneNode(true), url);
+    var cleanText = (clone.textContent || "").replace(/\s+/g, "");
+    if (cleanText.length < 300) throw new Error("Chapter body is empty");
+    return {
+      url: normalizeUrl(url),
+      title: title,
+      html: clone.innerHTML,
+      nextUrl: nextInfo ? normalizeUrl(nextInfo.url) : null,
+      titleAlreadyPresent: title && cleanText.indexOf(title.replace(/\s+/g, "")) === 0
+    };
+  }
+
+  function isCloudflareChallenge(html) {
+    return /cf-chl-|challenge-platform|Just a moment|验证您是真人|驗證您是真人/i.test(html || "");
+  }
+
+  /** Fetch and parse once; keep the actual chapter in memory, not only HTTP cache. */
+  function fetchChapter(url) {
+    url = normalizeUrl(url);
+    if (!url) return Promise.reject(new Error("Invalid chapter URL"));
+    if (chapterCache[url]) return Promise.resolve(chapterCache[url]);
+    if (chapterRequests[url]) return chapterRequests[url];
+
+    chapterRequests[url] = fetch(url, {
+      credentials: "include",
+      cache: "force-cache",
+      redirect: "follow"
+    })
+      .then(function (response) {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.text();
+      })
+      .then(function (html) {
+        if (isCloudflareChallenge(html)) throw new Error("Cloudflare challenge");
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        doc.__twkanSourceUrl = url;
+        var chapter = extractChapter(doc, url);
+        chapterCache[url] = chapter;
+        delete chapterRequests[url];
+        return chapter;
+      })
+      .catch(function (error) {
+        delete chapterRequests[url];
+        throw error;
+      });
+    return chapterRequests[url];
   }
 
   function prefetchChain(url, depth) {
-    if (!url || depth <= 0 || prefetchedHas(url)) return;
-    prefetchedAdd(url);
-    fetch(url, {
-      credentials: "include",
-      cache: "force-cache"
-    })
-      .then(function (res) {
-        if (!res.ok || depth <= 1) return null;
-        return res.text();
+    if (!url || depth <= 0) return Promise.resolve();
+    return fetchChapter(url)
+      .then(function (chapter) {
+        if (chapter.nextUrl && depth > 1) {
+          return prefetchChain(chapter.nextUrl, depth - 1);
+        }
       })
-      .then(function (html) {
-        if (!html) return;
-        try {
-          var parser = new DOMParser();
-          var doc = parser.parseFromString(html, "text/html");
-          var nextUrl = findNextChapterUrl(doc);
-          if (nextUrl) prefetchChain(nextUrl, depth - 1);
-        } catch (e) { /* ignore */ }
-      })
-      .catch(function () { /* non-fatal */ });
+      .catch(function () { /* prefetch failures must not interrupt reading */ });
   }
 
-  function initPreloader() {
-    // Wait 2s so prefetch doesn't compete with the current page's own requests
-    setTimeout(function () {
-      var nextUrl = findNextChapterUrl(document);
-      if (nextUrl) prefetchChain(nextUrl, PREFETCH_AHEAD);
-    }, 2000);
+  function setLoadingState(text, isError) {
+    if (!loadingIndicator) return;
+    loadingIndicator.textContent = text || "";
+    loadingIndicator.className = "twkan-infinite-status" + (isError ? " twkan-infinite-error" : "");
+    loadingIndicator.style.display = text ? "block" : "none";
+  }
+
+  function appendNextChapter() {
+    if (appendingChapter || noMoreChapters || !nextChapterUrl || !infiniteHost) {
+      return Promise.resolve(null);
+    }
+    var requestedUrl = normalizeUrl(nextChapterUrl);
+    if (!requestedUrl || appendedUrls[requestedUrl]) {
+      noMoreChapters = true;
+      setLoadingState("已到最后一章", false);
+      return Promise.resolve(null);
+    }
+
+    appendingChapter = true;
+    setLoadingState("正在加载下一章…", false);
+
+    return fetchChapter(requestedUrl)
+      .then(function (chapter) {
+        var section = document.createElement("section");
+        section.className = "twkan-infinite-chapter";
+        section.setAttribute("data-twkan-infinite-managed", "true");
+        section.setAttribute("data-chapter-url", chapter.url);
+
+        var separator = document.createElement("div");
+        separator.className = "twkan-chapter-separator";
+        separator.setAttribute("aria-hidden", "true");
+        section.appendChild(separator);
+
+        if (chapter.title && !chapter.titleAlreadyPresent) {
+          var heading = document.createElement("h2");
+          heading.className = "twkan-appended-chapter-title";
+          heading.textContent = chapter.title;
+          section.appendChild(heading);
+        }
+
+        var body = document.createElement("div");
+        body.className = "twkan-appended-chapter-body";
+        body.innerHTML = chapter.html;
+        section.appendChild(body);
+
+        // Convert while detached, so raw traditional Chinese is never flashed.
+        simplify(section, false);
+        infiniteHost.insertBefore(section, loadingIndicator);
+
+        appendedUrls[chapter.url] = true;
+        nextChapterUrl = chapter.nextUrl;
+        appendingChapter = false;
+
+        if (!nextChapterUrl || appendedUrls[nextChapterUrl]) {
+          noMoreChapters = true;
+          setLoadingState("已到最后一章", false);
+        } else {
+          setLoadingState("", false);
+          prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
+        }
+        return section;
+      })
+      .catch(function () {
+        appendingChapter = false;
+        setLoadingState("下一章加载失败，点这里重试", true);
+        return null;
+      });
+  }
+
+  function hideOriginalChapterNavigation(nextElement) {
+    if (!nextElement) return;
+    var holder = nextElement.closest("nav, .pager, .pagination, .chapter-nav, .page-nav, .read-nav");
+    if (!holder) {
+      var parent = nextElement.parentElement;
+      if (parent && (parent.textContent || "").replace(/\s+/g, "").length < 180) holder = parent;
+    }
+    if (holder) holder.style.display = "none";
+  }
+
+  function initInfiniteReader() {
+    if (infiniteInitialized) return;
+
+    var nextInfo = findNextChapter(document);
+    var contentRoot = findContentRoot(document);
+    if (!isLikelyChapterPage(document, contentRoot, nextInfo)) return;
+
+    infiniteInitialized = true;
+    nextChapterUrl = normalizeUrl(nextInfo.url);
+    appendedUrls[normalizeUrl(window.location.href)] = true;
+
+    infiniteHost = document.createElement("div");
+    infiniteHost.className = "twkan-infinite-host";
+    infiniteHost.setAttribute("data-twkan-infinite-managed", "true");
+
+    loadingIndicator = document.createElement("div");
+    loadingIndicator.className = "twkan-infinite-status";
+    loadingIndicator.style.display = "none";
+    loadingIndicator.addEventListener("click", function () {
+      if (loadingIndicator.classList.contains("twkan-infinite-error")) appendNextChapter();
+    });
+    infiniteHost.appendChild(loadingIndicator);
+
+    var sentinel = document.createElement("div");
+    sentinel.className = "twkan-infinite-sentinel";
+    sentinel.setAttribute("aria-hidden", "true");
+    infiniteHost.appendChild(sentinel);
+
+    if (contentRoot === document.body || contentRoot === document.documentElement || !contentRoot.parentNode) {
+      document.body.appendChild(infiniteHost);
+    } else {
+      contentRoot.parentNode.insertBefore(infiniteHost, contentRoot.nextSibling);
+    }
+    hideOriginalChapterNavigation(nextInfo.element);
+
+    // Load when the reader is roughly 1.5 screens from the bottom.
+    if (typeof IntersectionObserver !== "undefined") {
+      var observer = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].isIntersecting) {
+            appendNextChapter();
+            return;
+          }
+        }
+      }, { root: null, rootMargin: "1600px 0px", threshold: 0 });
+      observer.observe(sentinel);
+    } else {
+      window.addEventListener("scroll", function () {
+        if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 1600) {
+          appendNextChapter();
+        }
+      }, { passive: true });
+    }
+
+    // Clicking the site's old "next chapter" link appends instead of navigating.
+    document.addEventListener("click", function (event) {
+      var target = event.target;
+      var anchor = target && target.closest ? target.closest("a[href]") : null;
+      if (!anchor || !nextChapterUrl) return;
+      var clickedUrl = normalizeUrl(anchor.getAttribute("href"));
+      if (clickedUrl === normalizeUrl(nextChapterUrl)) {
+        event.preventDefault();
+        appendNextChapter().then(function (section) {
+          if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      }
+    }, true);
+
+    // Fill the 3-chapter memory cache immediately; append only near the bottom.
+    prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
   }
 
   // ─── Public run entry ─────────────────────────────────────────────────────
   window[runKey] = function () {
-    pageReadySent = false; // reset for each new page
+    pageReadySent = false;
     schedule(document.body || document.documentElement, true /* isFirstPass */);
     initAdBlocker();
-    initPreloader();
+    setTimeout(initInfiniteReader, 500);
   };
 
   if (window[installedKey]) {
@@ -302,6 +651,14 @@
     if (converting) return;
     for (var i = 0; i < mutations.length; i++) {
       var m = mutations[i];
+      var target = m.target && m.target.nodeType === Node.ELEMENT_NODE
+        ? m.target
+        : (m.target ? m.target.parentElement : null);
+      // Infinite-reader chapters are converted while detached. Ignore their
+      // insertion/status mutations to avoid reconverting the entire novel.
+      if (target && target.closest && target.closest("[data-twkan-infinite-managed='true']")) {
+        continue;
+      }
       if (m.type === "characterData" || m.type === "attributes" || m.addedNodes.length > 0) {
         schedule(document.body || document.documentElement, false);
         return;
@@ -331,7 +688,16 @@
     'iframe[src*="doubleclick"] { display: none !important; }',
     'iframe[src*="googlesyndication"] { display: none !important; }',
     '[class*="banner"] { display: none !important; }',
-    '[id*="banner"] { display: none !important; }'
+    '[id*="banner"] { display: none !important; }',
+    '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
+    '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; }',
+    '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 48px auto 30px !important; background: rgba(127,127,127,.32) !important; }',
+    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 24px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
+    '.twkan-appended-chapter-body { display: block !important; }',
+    '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
+    '.twkan-infinite-status { display: block; padding: 24px 12px !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
+    '.twkan-infinite-error { color: #b85c00 !important; cursor: pointer !important; }',
+    '.twkan-infinite-sentinel { display: block !important; width: 1px !important; height: 1px !important; }'
   ].join("\n");
   document.head.appendChild(style);
 }());
