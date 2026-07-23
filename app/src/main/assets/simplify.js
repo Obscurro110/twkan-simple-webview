@@ -241,8 +241,9 @@
     "#chaptercontent", "#chapter-content", "#chapterContent",
     "#content", "#BookText", "#booktext",
     ".chapter-content", ".chapterContent", ".read-content",
-    ".reading-content", ".article-content", ".novel-content",
-    ".book-content", ".entry-content", ".contentbox", ".txtnav",
+    ".reading-content", ".read-main", ".readbox", ".txtbox",
+    ".article-content", ".novel-content", ".book-content",
+    ".entry-content", ".contentbox", ".txtnav", ".txt", "#txt",
     "article"
   ];
 
@@ -283,15 +284,16 @@
       var rawHref = a.getAttribute("href");
       var href = resolveUrl(rawHref, baseUrl);
       if (!href || !/^https?:/i.test(href)) continue;
-      if (/上一|返回|目录|書目|书目/.test(text)) continue;
+      if (/上一|返回|目录|書目|书目|首頁|首页/.test(text)) continue;
 
       var score = 0;
-      if (/^下一[章话話節节篇頁页集卷]$/.test(text)) score += 100;
-      else if (/下一[章话話節节篇頁页集卷]/.test(text)) score += 80;
-      if (/next\s*chap/i.test(text) || /^next$/i.test(text)) score += 70;
+      if (/^下一[章话話節节篇頁页集卷回页頁]$/.test(text)) score += 100;
+      else if (/下一[章话話節节篇頁页集卷回页頁]/.test(text)) score += 85;
+      if (/^(下页|下頁|继续|繼續|继续阅读|繼續閱讀|继续看|繼續看)$/.test(text)) score += 75;
+      if (/next\s*(chap|page)?/i.test(text) || /^(next|continue)$/i.test(text)) score += 70;
       if (rel === "next") score += 60;
-      if (/(^|[-_])next($|[-_])|nextchapter|chapter-next/.test(marker)) score += 45;
-      if (/下一/.test(title)) score += 35;
+      if (/(^|[-_])(next|continue)([-_]|$)|next(chapter|page)|chapter-next|page-next/.test(marker)) score += 45;
+      if (/下一|下页|下頁|继续|繼續/.test(title)) score += 35;
       if (href === window.location.href) score = -1;
 
       if (score > bestScore && score > 0) {
@@ -308,7 +310,8 @@
       var matches = doc.querySelectorAll(CONTENT_SELECTORS[i]);
       for (var m = 0; m < matches.length; m++) {
         var directText = (matches[m].textContent || "").replace(/\s+/g, "");
-        if (directText.length >= 350) return matches[m];
+        // Short notices such as leave announcements can be valid chapters.
+        if (directText.length >= 40) return matches[m];
       }
     }
 
@@ -324,7 +327,7 @@
         continue;
       }
       var text = (el.textContent || "").replace(/\s+/g, "");
-      if (text.length < 500) continue;
+      if (text.length < 40) continue;
       var linkText = "";
       var elementLinks = el.querySelectorAll("a");
       for (var l = 0; l < elementLinks.length; l++) {
@@ -366,14 +369,24 @@
   function isLikelyChapterPage(doc, contentRoot, nextInfo) {
     if (!contentRoot) return false;
     var text = (contentRoot.textContent || "").replace(/\s+/g, "");
-    if (text.length < 500) return false;
+    if (text.length < 20) return false;
     var heading = getChapterTitle(doc, contentRoot);
+    var pageText = ((doc.body && doc.body.textContent) || "").replace(/\s+/g, "");
+    var shortNotice = /请假|請假|请假条|請假條|公告|通知|停更|暫停更新|暂停更新|休更|断更|斷更|请几天假|請幾天假/.test(
+      heading + text.substring(0, 120) + pageText.substring(0, 300)
+    );
     var chapterSignal = /第.{0,12}[章话話節节篇頁页集卷回]/.test(heading) ||
-      (nextInfo && /下一[章话話節节篇集卷回]/.test(nextInfo.text)) ||
+      (nextInfo && /下一[章话話節节篇集卷回页頁]|下页|下頁|继续|繼續/.test(nextInfo.text)) ||
+      shortNotice ||
       /chapter|read|novel|book/i.test(sourceUrlFor(doc));
-    var paragraphSignal = contentRoot.querySelectorAll("p").length >= 3 ||
-      contentRoot.querySelectorAll("br").length >= 5;
-    return chapterSignal && paragraphSignal;
+    var paragraphSignal = contentRoot.querySelectorAll("p").length >= 1 ||
+      contentRoot.querySelectorAll("br").length >= 2 ||
+      /[。！？!?；;]/.test(text);
+
+    // A short notice is still a valid chapter. Ordinary chapters retain a
+    // stricter text/paragraph check to avoid selecting menus or footers.
+    if (shortNotice) return chapterSignal && text.length >= 20;
+    return chapterSignal && (paragraphSignal || text.length >= 120);
   }
 
   function sanitizeChapterContent(root, baseUrl) {
@@ -428,7 +441,7 @@
     var title = getChapterTitle(doc, root);
     var clone = sanitizeChapterContent(root.cloneNode(true), url);
     var cleanText = (clone.textContent || "").replace(/\s+/g, "");
-    if (cleanText.length < 300) throw new Error("Chapter body is empty");
+    if (cleanText.length < 20) throw new Error("Chapter body is empty");
     return {
       url: normalizeUrl(url),
       title: title,
@@ -655,7 +668,7 @@
 
     var nextInfo = findNextChapter(document);
     var contentRoot = findContentRoot(document);
-    if (!isLikelyChapterPage(document, contentRoot, nextInfo)) return;
+    if (!nextInfo || !isLikelyChapterPage(document, contentRoot, nextInfo)) return;
 
     infiniteInitialized = true;
     initialChapterUrl = normalizeUrl(sourceUrlFor(document));
