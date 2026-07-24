@@ -268,6 +268,53 @@
     return doc.__twkanSourceUrl || window.location.href;
   }
 
+  var NON_CHAPTER_PATH_PATTERN = /(?:^|\/)(?:bookshelf|bookcase|shelf|reading[-_]?history|history|records?|record|favorites?|bookmarks?|user|member|account|login|register|search|category|categories|sort|list|catalog|directory)(?:[\/?#._-]|$)/i;
+
+  // Library/history pages can contain a "continue reading" link. That link
+  // must not be mistaken for the next chapter of the current reader.
+  function isLibraryOrHistoryPage(doc) {
+    var url = sourceUrlFor(doc);
+    var title = (doc.title || "").replace(/\s+/g, "").trim();
+    var bodyText = ((doc.body && doc.body.textContent) || "").replace(/\s+/g, "");
+
+    if (/阅读记录是存储在本地的|閱讀記錄是存儲在本地的/.test(bodyText)) return true;
+    if (/阅读记录|閱讀記錄|阅读历史|閱讀歷史|我的书架|我的書架/.test(title)) return true;
+
+    try {
+      var pathname = new URL(url, window.location.href).pathname || "";
+      if (NON_CHAPTER_PATH_PATTERN.test(pathname)) return true;
+    } catch (e) { /* ignore malformed URLs */ }
+
+    return false;
+  }
+
+  function stopInfiniteReaderOnLibraryPage() {
+    if (!infiniteInitialized || !isLibraryOrHistoryPage(document)) return false;
+
+    var managed = document.querySelectorAll("[data-twkan-infinite-managed='true']");
+    for (var i = managed.length - 1; i >= 0; i--) managed[i].remove();
+
+    var tracked = document.querySelectorAll("[data-twkan-reading-chapter='true']");
+    for (i = 0; i < tracked.length; i++) {
+      tracked[i].removeAttribute("data-twkan-reading-chapter");
+      tracked[i].removeAttribute("data-chapter-url");
+      tracked[i].removeAttribute("data-chapter-title");
+    }
+
+    infiniteInitialized = false;
+    infiniteHost = null;
+    loadingIndicator = null;
+    nextChapterUrl = null;
+    appendingChapter = false;
+    noMoreChapters = false;
+    currentReadingUrl = null;
+    if (readingTrackerTimer !== null) {
+      window.cancelAnimationFrame(readingTrackerTimer);
+      readingTrackerTimer = null;
+    }
+    return true;
+  }
+
   /** Locate the most likely "next chapter" link and resolve it absolutely. */
   function findNextChapter(doc) {
     var links = doc.querySelectorAll("a[href]");
@@ -367,6 +414,7 @@
   }
 
   function isLikelyChapterPage(doc, contentRoot, nextInfo) {
+    if (isLibraryOrHistoryPage(doc)) return false;
     if (!contentRoot) return false;
     var text = (contentRoot.textContent || "").replace(/\s+/g, "");
     if (text.length < 20) return false;
@@ -378,7 +426,9 @@
     var chapterSignal = /第.{0,12}[章话話節节篇頁页集卷回]/.test(heading) ||
       (nextInfo && /下一[章话話節节篇集卷回页頁]|下页|下頁|继续|繼續/.test(nextInfo.text)) ||
       shortNotice ||
-      /chapter|read|novel|book/i.test(sourceUrlFor(doc));
+      // A URL alone is not enough: history/list pages often contain "read"
+      // in their path and also expose a continue-reading link.
+      false;
     var paragraphSignal = contentRoot.querySelectorAll("p").length >= 1 ||
       contentRoot.querySelectorAll("br").length >= 2 ||
       /[。！？!?；;]/.test(text);
@@ -664,6 +714,7 @@
   }
 
   function initInfiniteReader() {
+    if (stopInfiniteReaderOnLibraryPage()) return;
     if (infiniteInitialized) return;
 
     var nextInfo = findNextChapter(document);
@@ -770,6 +821,7 @@
   // ─── MutationObserver (subsequent updates, not first pass) ────────────────
   var observer = new MutationObserver(function (mutations) {
     if (converting) return;
+    if (stopInfiniteReaderOnLibraryPage()) return;
     for (var i = 0; i < mutations.length; i++) {
       var m = mutations[i];
       var target = m.target && m.target.nodeType === Node.ELEMENT_NODE
