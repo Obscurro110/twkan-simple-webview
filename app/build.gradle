@@ -2,25 +2,16 @@ plugins {
     id "com.android.application"
 }
 
-// Auto version from git:
-//   versionCode = total commit count (increments with every commit)
-//   versionName = "1.0.YYYYMMDD-<short-sha>"
-static def getGitVersionCode() {
+// Release versions are explicit and intentionally short, for example 1.1.0.
+// CI passes -PappVersion=1.1.0 when publishing a version tag.
+def appVersionName = project.findProperty("appVersion") ?: "1.1.0"
+
+def getGitVersionCode() {
     try {
         def cmd = "git rev-list --count HEAD"
         return cmd.execute().text.trim().toInteger()
     } catch (ignored) {
         return 1
-    }
-}
-
-static def getGitVersionName() {
-    try {
-        def sha  = "git rev-parse --short HEAD".execute().text.trim()
-        def date = new Date().format("yyyyMMdd")
-        return "1.0.${date}-${sha}"
-    } catch (ignored) {
-        return "1.0.0"
     }
 }
 
@@ -33,7 +24,7 @@ android {
         minSdk 29
         targetSdk 35
         versionCode getGitVersionCode()
-        versionName getGitVersionName()
+        versionName appVersionName
     }
 
     signingConfigs {

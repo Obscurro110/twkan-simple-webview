@@ -28,6 +28,28 @@ gradle :app:assembleDebug
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## 兼容性
+## 发布版本
+
+版本号使用简洁的语义化格式，例如 `v1.1.0`、`v1.1.1`、`v1.2.0`。
+
+创建版本时先在 `RELEASE_NOTES.md` 写入本次具体更新内容，再创建并推送版本标签：
+
+```powershell
+git add .
+git commit -m "release: v1.1.0"
+git tag v1.1.0
+git push origin main
+git push origin v1.1.0
+```
+
+GitHub Actions 只会在推送 `v*` 标签时创建 Release。每个版本会保留独立的 Release，APK 文件名格式为：
+
+```text
+twkan-simple-webview-v1.1.0-debug.apk
+twkan-simple-webview-v1.1.0-release.apk
+```
+
+普通提交只构建 APK，不会创建或覆盖 Release。正式使用推荐下载 `release` APK。
+
 
 `android.icu.text.Transliterator` 的公开 API 从 Android 10/API 29 可用，所以 `minSdk` 设置为 29。如果需要支持更老设备，建议改为内置 OpenCC 字典或引入对应转换库，而不是只做简单字符表替换。
