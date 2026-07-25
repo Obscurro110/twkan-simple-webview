@@ -51,9 +51,41 @@
     });
   }
 
+  var PROMOTIONAL_TEXT_PATTERN = /记住首发网站域名|記住首發網站域名|本书首发|本書首發|无错章节|無錯章節|无乱序章节|無亂序章節|提供给你无错章节|提供給你無錯章節|首发台湾小说网|首發臺灣小說網|(?:首发|首發).{0,80}(?:twkan|𝕥𝕨𝕜𝕒𝕟|t̲)/i;
+
+  function removePromotionalText(root) {
+    if (!root || !root.querySelectorAll) return;
+
+    var candidates = root.querySelectorAll("p, li, small, footer");
+    for (var i = candidates.length - 1; i >= 0; i--) {
+      var candidate = candidates[i];
+      if (candidate.getAttribute && candidate.getAttribute("data-twkan-reader-ui") === "true") continue;
+      var text = (candidate.textContent || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "");
+      if (text.length > 0 && text.length <= 500 && PROMOTIONAL_TEXT_PATTERN.test(text)) {
+        candidate.remove();
+      }
+    }
+
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var textNodes = [];
+    var node;
+    while ((node = walker.nextNode())) {
+      if (node.parentElement && node.parentElement.closest &&
+          node.parentElement.closest("[data-twkan-reader-ui='true']")) continue;
+      var nodeText = (node.nodeValue || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "");
+      if (nodeText.length > 0 && PROMOTIONAL_TEXT_PATTERN.test(nodeText)) textNodes.push(node);
+    }
+    for (i = 0; i < textNodes.length; i++) textNodes[i].remove();
+  }
+
+
   function initAdBlocker() {
     removeAds();
-    setInterval(removeAds, 2000);
+    removePromotionalText(document.body || document.documentElement);
+    setInterval(function () {
+      removeAds();
+      removePromotionalText(document.body || document.documentElement);
+    }, 2000);
   }
 
   // ─── Constants ────────────────────────────────────────────────────────────
@@ -236,6 +268,16 @@
   var initialChapterTitle = null;
   var currentReadingUrl = null;
   var readingTrackerTimer = null;
+  var READING_SETTINGS_KEY = "twkan:readingSettings";
+  var readingSettings = {
+    fontSize: 20,
+    lineHeight: 1.9,
+    letterSpacing: 0,
+    background: "site"
+  };
+  var readingSettingsInitialized = false;
+
+
 
   var CONTENT_SELECTORS = [
     "#chaptercontent", "#chapter-content", "#chapterContent",
@@ -246,6 +288,68 @@
     ".entry-content", ".contentbox", ".txtnav", ".txt", "#txt",
     "article"
   ];
+
+  function loadReadingSettings() {
+    try {
+      var stored = JSON.parse(localStorage.getItem(READING_SETTINGS_KEY) || "null");
+      if (stored && typeof stored === "object") {
+        if (isFinite(Number(stored.fontSize))) readingSettings.fontSize = Math.max(14, Math.min(32, Number(stored.fontSize)));
+        if (isFinite(Number(stored.lineHeight))) readingSettings.lineHeight = Math.max(1.3, Math.min(3, Number(stored.lineHeight)));
+        if (isFinite(Number(stored.letterSpacing))) readingSettings.letterSpacing = Math.max(-1, Math.min(4, Number(stored.letterSpacing)));
+        if (/^(site|white|warm|green|gray|dark)$/.test(stored.background)) readingSettings.background = stored.background;
+      }
+    } catch (e) { /* use defaults */ }
+    readingSettingsInitialized = true;
+  }
+
+  function saveReadingSettings() {
+    try { localStorage.setItem(READING_SETTINGS_KEY, JSON.stringify(readingSettings)); } catch (e) { /* ignore */ }
+  }
+
+  function applyReadingSettings() {
+    if (!readingSettingsInitialized) loadReadingSettings();
+    var root = document.documentElement;
+    root.style.setProperty("--twkan-reader-font-size", readingSettings.fontSize + "px");
+    root.style.setProperty("--twkan-reader-line-height", readingSettings.lineHeight);
+    root.style.setProperty("--twkan-reader-letter-spacing", readingSettings.letterSpacing + "px");
+
+    var colors = {
+      site: "transparent",
+      white: "#ffffff",
+      warm: "#f7f0df",
+      green: "#dcebdc",
+      gray: "#eeeeee",
+      dark: "#202124"
+    };
+    root.style.setProperty("--twkan-reader-background", colors[readingSettings.background] || colors.site);
+    root.style.setProperty("--twkan-reader-foreground", readingSettings.background === "dark" ? "#eeeeee" : "inherit");
+    root.setAttribute("data-twkan-reader-bg", readingSettings.background);
+
+    var controls = document.querySelectorAll("[data-twkan-setting]");
+    for (var i = 0; i < controls.length; i++) {
+      var key = controls[i].getAttribute("data-twkan-setting");
+      if (key === "fontSize") controls[i].value = readingSettings.fontSize;
+      if (key === "lineHeight") controls[i].value = readingSettings.lineHeight;
+      if (key === "letterSpacing") controls[i].value = readingSettings.letterSpacing;
+      if (key === "background") controls[i].value = readingSettings.background;
+    }
+  }
+
+  function updateReadingSetting(key, value) {
+    if (key === "fontSize") readingSettings.fontSize = Math.max(14, Math.min(32, Number(value)));
+    if (key === "lineHeight") readingSettings.lineHeight = Math.max(1.3, Math.min(3, Number(value)));
+    if (key === "letterSpacing") readingSettings.letterSpacing = Math.max(-1, Math.min(4, Number(value)));
+    if (key === "background" && /^(site|white|warm|green|gray|dark)$/.test(value)) readingSettings.background = value;
+    saveReadingSettings();
+    applyReadingSettings();
+  }
+
+  function resetReadingSettings() {
+    readingSettings = { fontSize: 20, lineHeight: 1.9, letterSpacing: 0, background: "site" };
+    saveReadingSettings();
+    applyReadingSettings();
+  }
+
 
   function resolveUrl(raw, baseUrl) {
     if (!raw) return null;
@@ -699,6 +803,7 @@
     }
     var title = getChapterTitle(doc, root);
     var clone = sanitizeChapterContent(root.cloneNode(true), url);
+    removePromotionalText(clone);
     removeDuplicateChapterTitle(clone, title);
     normalizeChapterLayout(clone);
     var cleanText = (clone.textContent || "").replace(/\s+/g, "");
@@ -914,6 +1019,121 @@
       });
   }
 
+  function ensureReadingSettingsPanel() {
+    if (document.querySelector("[data-twkan-reader-settings='true']")) {
+      applyReadingSettings();
+      return;
+    }
+    loadReadingSettings();
+
+    var toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.textContent = "Aa";
+    toggle.title = "阅读设置";
+    toggle.setAttribute("aria-label", "阅读设置");
+    toggle.setAttribute("data-twkan-reader-ui", "true");
+    toggle.setAttribute("data-twkan-reader-settings-toggle", "true");
+
+    var panel = document.createElement("div");
+    panel.setAttribute("data-twkan-reader-ui", "true");
+    panel.setAttribute("data-twkan-reader-settings", "true");
+    panel.style.display = "none";
+
+    var titleRow = document.createElement("div");
+    titleRow.className = "twkan-settings-title-row";
+    var title = document.createElement("strong");
+    title.textContent = "阅读设置";
+    titleRow.appendChild(title);
+    var close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "×";
+    close.title = "关闭设置";
+    close.setAttribute("aria-label", "关闭设置");
+    close.className = "twkan-settings-close";
+    titleRow.appendChild(close);
+    panel.appendChild(titleRow);
+
+    function addRange(key, labelText, min, max, step, unit) {
+      var row = document.createElement("label");
+      row.className = "twkan-settings-row";
+      var caption = document.createElement("span");
+      caption.textContent = labelText;
+      var value = document.createElement("output");
+      value.className = "twkan-settings-value";
+      var input = document.createElement("input");
+      input.type = "range";
+      input.min = min;
+      input.max = max;
+      input.step = step;
+      input.setAttribute("data-twkan-setting", key);
+      input.addEventListener("input", function () {
+        updateReadingSetting(key, input.value);
+        value.textContent = input.value + unit;
+      });
+      row.appendChild(caption);
+      row.appendChild(value);
+      row.appendChild(input);
+      panel.appendChild(row);
+      return { input: input, value: value };
+    }
+
+    var font = addRange("fontSize", "字体大小", 14, 32, 1, "px");
+    var line = addRange("lineHeight", "行距", 1.3, 3, 0.1, "");
+    var spacing = addRange("letterSpacing", "字间距", -1, 4, 0.1, "px");
+
+    var colorRow = document.createElement("label");
+    colorRow.className = "twkan-settings-row";
+    var colorLabel = document.createElement("span");
+    colorLabel.textContent = "背景色";
+    var color = document.createElement("select");
+    color.setAttribute("data-twkan-setting", "background");
+    var colors = [
+      ["site", "跟随网站"], ["white", "白色"], ["warm", "暖色"],
+      ["green", "浅绿色"], ["gray", "灰色"], ["dark", "深色"]
+    ];
+    for (var i = 0; i < colors.length; i++) {
+      var option = document.createElement("option");
+      option.value = colors[i][0];
+      option.textContent = colors[i][1];
+      color.appendChild(option);
+    }
+    color.addEventListener("change", function () { updateReadingSetting("background", color.value); });
+    colorRow.appendChild(colorLabel);
+    colorRow.appendChild(color);
+    panel.appendChild(colorRow);
+
+    var reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "恢复默认";
+    reset.className = "twkan-settings-reset";
+    reset.addEventListener("click", function () {
+      resetReadingSettings();
+      updateLabels();
+    });
+    panel.appendChild(reset);
+
+    toggle.addEventListener("click", function () {
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+      applyReadingSettings();
+    });
+    close.addEventListener("click", function () { panel.style.display = "none"; });
+
+    document.body.appendChild(toggle);
+    document.body.appendChild(panel);
+    applyReadingSettings();
+
+    function updateLabels() {
+      font.value.textContent = readingSettings.fontSize + "px";
+      font.input.value = readingSettings.fontSize;
+      line.value.textContent = readingSettings.lineHeight;
+      line.input.value = readingSettings.lineHeight;
+      spacing.value.textContent = readingSettings.letterSpacing + "px";
+      spacing.input.value = readingSettings.letterSpacing;
+    }
+    updateLabels();
+  }
+
+
   function hideOriginalChapterNavigation(nextElement) {
     if (!nextElement) return;
     var holder = nextElement.closest("nav, .pager, .pagination, .chapter-nav, .page-nav, .read-nav");
@@ -930,19 +1150,22 @@
 
     var nextInfo = findNextChapter(document);
     var contentRoot = findContentRoot(document);
-    if (!nextInfo || !isLikelyChapterPage(document, contentRoot, nextInfo)) return;
+    if (!contentRoot || !isLikelyChapterPage(document, contentRoot, nextInfo)) return;
 
     infiniteInitialized = true;
     initialChapterUrl = normalizeUrl(sourceUrlFor(document));
     initialChapterTitle = getChapterTitle(document, contentRoot) || document.title;
+    removePromotionalText(contentRoot);
+
     normalizeChapterLayout(contentRoot);
     currentReadingUrl = initialChapterUrl;
-    nextChapterUrl = normalizeUrl(nextInfo.url);
+    nextChapterUrl = nextInfo ? normalizeUrl(nextInfo.url) : null;
     appendedUrls[initialChapterUrl] = true;
 
     // Treat the original chapter as the first tracked section. Its URL remains
     // the real network URL even after history.replaceState changes location.
     contentRoot.setAttribute("data-twkan-reading-chapter", "true");
+    document.body.setAttribute("data-twkan-reader-active", "true");
     contentRoot.setAttribute("data-chapter-url", initialChapterUrl);
     contentRoot.setAttribute("data-chapter-title", initialChapterTitle || "");
     persistLocalReadingProgress(initialChapterUrl, initialChapterTitle);
@@ -969,7 +1192,8 @@
     } else {
       contentRoot.parentNode.insertBefore(infiniteHost, contentRoot.nextSibling);
     }
-    hideOriginalChapterNavigation(nextInfo.element);
+    hideOriginalChapterNavigation(nextInfo && nextInfo.element);
+    ensureReadingSettingsPanel();
 
     // Load when the reader is roughly 1.5 screens from the bottom.
     if (typeof IntersectionObserver !== "undefined") {
@@ -1005,7 +1229,7 @@
     }, true);
 
     // Fill the 3-chapter memory cache immediately; append only near the bottom.
-    prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
+    if (nextChapterUrl) prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
 
 
     window.addEventListener("scroll", scheduleReadingTracker, { passive: true });
@@ -1075,13 +1299,26 @@
     '[class*="banner"] { display: none !important; }',
     '[id*="banner"] { display: none !important; }',
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
+    'body[data-twkan-reader-active="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    '[data-twkan-reading-chapter="true"] * { box-sizing: border-box; }',
+    '[data-twkan-reader-ui="true"] { font-family: sans-serif !important; letter-spacing: normal !important; line-height: normal !important; }',
+    '[data-twkan-reader-settings-toggle="true"] { position: fixed !important; right: 10px !important; bottom: 22px !important; z-index: 2147483000 !important; width: 48px !important; height: 48px !important; padding: 0 !important; border: 0 !important; border-radius: 10px !important; background: rgba(255,255,255,.94) !important; color: #333 !important; box-shadow: 0 2px 10px rgba(0,0,0,.22) !important; font-size: 18px !important; font-weight: 700 !important; }',
+    '[data-twkan-reader-settings="true"] { position: fixed !important; right: 10px !important; bottom: 78px !important; z-index: 2147482999 !important; width: min(310px, calc(100vw - 20px)) !important; max-height: calc(100vh - 100px) !important; overflow: auto !important; padding: 14px !important; border-radius: 10px !important; background: rgba(255,255,255,.98) !important; color: #222 !important; box-shadow: 0 4px 18px rgba(0,0,0,.28) !important; font-family: sans-serif !important; font-size: 14px !important; }',
+    '.twkan-settings-title-row { display: flex !important; align-items: center !important; justify-content: space-between !important; margin-bottom: 10px !important; }',
+    '.twkan-settings-close { border: 0 !important; background: transparent !important; padding: 0 5px !important; font-size: 24px !important; line-height: 1 !important; color: #555 !important; }',
+    '.twkan-settings-row { display: grid !important; grid-template-columns: 76px 1fr 44px !important; align-items: center !important; gap: 7px !important; margin: 10px 0 !important; }',
+    '.twkan-settings-row input[type="range"] { width: 100% !important; min-width: 0 !important; }',
+    '.twkan-settings-row select { grid-column: 2 / 4 !important; min-width: 0 !important; padding: 5px !important; }',
+    '.twkan-settings-value { text-align: right !important; color: #666 !important; font-variant-numeric: tabular-nums !important; }',
+    '.twkan-settings-reset { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #bbb !important; border-radius: 6px !important; background: #f5f5f5 !important; color: #222 !important; }',
+
     '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; }',
     '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 28px auto 18px !important; background: rgba(127,127,127,.32) !important; }',
-    '[data-twkan-reading-chapter="true"] { height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important; }',
-    '[data-twkan-reading-chapter="true"] > h1, [data-twkan-reading-chapter="true"] > h2, [data-twkan-reading-chapter="true"] > h3 { margin-top: 0 !important; margin-bottom: 6px !important; padding-top: 0 !important; padding-bottom: 0 !important; height: auto !important; min-height: 0 !important; }',
-    '[data-twkan-reading-chapter="true"] p, [data-twkan-reading-chapter="true"] div { height: auto !important; min-height: 0 !important; max-height: none !important; padding-top: 0 !important; padding-bottom: 0 !important; }',
+    '[data-twkan-reading-chapter="true"] { height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important; font-size: var(--twkan-reader-font-size) !important; line-height: var(--twkan-reader-line-height) !important; letter-spacing: var(--twkan-reader-letter-spacing) !important; background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    '[data-twkan-reading-chapter="true"] > h1, [data-twkan-reading-chapter="true"] > h2, [data-twkan-reading-chapter="true"] > h3 { margin-top: 0 !important; margin-bottom: 6px !important; padding-top: 0 !important; padding-bottom: 0 !important; height: auto !important; min-height: 0 !important; font-size: calc(var(--twkan-reader-font-size) * 1.35) !important; line-height: 1.55 !important; letter-spacing: var(--twkan-reader-letter-spacing) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reading-chapter="true"] p { margin-top: 0 !important; margin-bottom: 1em !important; }',
-    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 6px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
+    '[data-twkan-reading-chapter="true"] p, [data-twkan-reading-chapter="true"] div, [data-twkan-reading-chapter="true"] span { font-size: inherit !important; line-height: inherit !important; letter-spacing: inherit !important; color: inherit !important; }',
+    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 6px !important; padding: 0 12px !important; text-align: center !important; font-size: calc(var(--twkan-reader-font-size) * 1.35) !important; line-height: 1.55 !important; letter-spacing: var(--twkan-reader-letter-spacing) !important; color: var(--twkan-reader-foreground) !important; }',
     '.twkan-appended-chapter-body { display: block !important; margin: 0 !important; padding: 0 !important; height: auto !important; min-height: 0 !important; }',
     '.twkan-appended-chapter-body > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }',
     '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
