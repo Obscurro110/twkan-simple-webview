@@ -439,6 +439,86 @@
     return chapterSignal && (paragraphSignal || text.length >= 120);
   }
 
+  function normalizeChapterText(value) {
+    return (value || "").replace(/\s+/g, "").trim();
+  }
+
+  function removeDuplicateChapterTitle(root, title) {
+    var titleText = normalizeChapterText(title);
+    if (!root || titleText.length < 2) return false;
+
+    // Remove a standalone heading supplied by the website. The reader adds a
+    // single normalized heading outside the copied body below.
+    var headingNodes = root.querySelectorAll(
+      "h1, h2, h3, h4, h5, h6, .chapter-title, .chaptername, .chapter-name, " +
+      ".article-title, .entry-title, [class*='chapter-title'], [id*='chapter-title']"
+    );
+    for (var i = headingNodes.length - 1; i >= 0; i--) {
+      if (normalizeChapterText(headingNodes[i].textContent) === titleText) {
+        headingNodes[i].remove();
+      }
+    }
+
+    var emptyBlocks = root.querySelectorAll("p, div, section, h1, h2, h3, h4, h5, h6");
+    for (i = emptyBlocks.length - 1; i >= 0; i--) {
+      var emptyBlock = emptyBlocks[i];
+      if (normalizeChapterText(emptyBlock.textContent).length === 0 &&
+          !emptyBlock.querySelector("img, br, video, audio, iframe, a")) {
+        emptyBlock.remove();
+      }
+    }
+
+
+    // Some templates put the same title in the first paragraph or split it
+    // across several text nodes. Remove only a leading exact title prefix.
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        var parent = node.parentElement;
+        if (!parent || /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|INPUT|SELECT|OPTION)$/.test(parent.tagName)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    var textNodes = [];
+    var combined = "";
+    var node;
+    while ((node = walker.nextNode())) {
+      textNodes.push(node);
+      combined += node.nodeValue || "";
+    }
+
+    var compact = normalizeChapterText(combined);
+    if (compact.indexOf(titleText) !== 0 || compact.length <= titleText.length) return false;
+
+    var matched = 0;
+    var startNode = textNodes.length ? textNodes[0] : null;
+    var endNode = null;
+    var endOffset = 0;
+    for (i = 0; i < textNodes.length && matched < titleText.length; i++) {
+      var value = textNodes[i].nodeValue || "";
+      for (var offset = 0; offset < value.length && matched < titleText.length; offset++) {
+        var character = value.charAt(offset);
+        if (/\s/.test(character)) continue;
+        if (character !== titleText.charAt(matched)) return false;
+        matched++;
+        if (matched === titleText.length) {
+          endNode = textNodes[i];
+          endOffset = offset + 1;
+          break;
+        }
+      }
+    }
+
+    if (matched !== titleText.length || !endNode || !startNode) return false;
+    var range = document.createRange();
+    range.setStart(startNode, 0);
+    range.setEnd(endNode, endOffset);
+    range.deleteContents();
+    return true;
+  }
+
+
   function sanitizeChapterContent(root, baseUrl) {
     var unwanted = root.querySelectorAll(
       "script, style, noscript, iframe, object, embed, form, nav, " +
@@ -490,6 +570,7 @@
     }
     var title = getChapterTitle(doc, root);
     var clone = sanitizeChapterContent(root.cloneNode(true), url);
+    removeDuplicateChapterTitle(clone, title);
     var cleanText = (clone.textContent || "").replace(/\s+/g, "");
     if (cleanText.length < 20) throw new Error("Chapter body is empty");
     return {
@@ -497,7 +578,7 @@
       title: title,
       html: clone.innerHTML,
       nextUrl: nextInfo ? normalizeUrl(nextInfo.url) : null,
-      titleAlreadyPresent: title && cleanText.indexOf(title.replace(/\s+/g, "")) === 0
+      titleAlreadyPresent: false
     };
   }
 
@@ -865,8 +946,9 @@
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
     '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; }',
     '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 48px auto 30px !important; background: rgba(127,127,127,.32) !important; }',
-    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 24px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
-    '.twkan-appended-chapter-body { display: block !important; }',
+    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 10px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
+    '.twkan-appended-chapter-body { display: block !important; margin: 0 !important; padding: 0 !important; }',
+    '.twkan-appended-chapter-body > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }',
     '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
     '.twkan-infinite-status { display: block; padding: 24px 12px !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
     '.twkan-infinite-error { color: #b85c00 !important; cursor: pointer !important; }',

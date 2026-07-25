@@ -17,13 +17,17 @@ import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
@@ -100,6 +104,10 @@ public class MainActivity extends Activity {
     private WebView webView;
     private WebView readingSyncWebView;
     private ProgressBar progressBar;
+    private View networkErrorOverlay;
+    private TextView networkErrorDetail;
+    private String failedPageUrl;
+    private boolean pageLoadFailed;
     private String simplifierScript;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable showPageRunnable;
@@ -144,7 +152,142 @@ public class MainActivity extends Activity {
         progressParams.gravity = Gravity.TOP;
         root.addView(progressBar, progressParams);
 
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminate(true);
+        root.addView(progress, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+        ));
+        progress.setVisibility(View.GONE);
+
+        networkErrorOverlay = createNetworkErrorOverlay();
+        root.addView(networkErrorOverlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+        networkErrorOverlay.setVisibility(View.GONE);
+
         setContentView(root);
+    }
+
+    private View createNetworkErrorOverlay() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+        panel.setPadding(dp(28), dp(28), dp(28), dp(28));
+        panel.setBackgroundColor(Color.WHITE);
+
+        TextView title = new TextView(this);
+        title.setText(R.string.network_error_title);
+        title.setTextColor(Color.rgb(45, 45, 45));
+        title.setTextSize(22);
+        title.setGravity(Gravity.CENTER);
+        panel.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
+        networkErrorDetail = new TextView(this);
+        networkErrorDetail.setText(R.string.network_error_message);
+        networkErrorDetail.setTextColor(Color.rgb(100, 100, 100));
+        networkErrorDetail.setTextSize(16);
+        networkErrorDetail.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams detailParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        detailParams.topMargin = dp(12);
+        panel.addView(networkErrorDetail, detailParams);
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setGravity(Gravity.CENTER);
+        actions.setPadding(0, dp(24), 0, 0);
+
+        Button retry = createActionButton(R.string.retry);
+        retry.setOnClickListener(v -> retryFailedPage());
+        actions.addView(retry);
+
+        Button back = createActionButton(R.string.go_back);
+        back.setOnClickListener(v -> navigateBack());
+        actions.addView(back);
+
+        Button forward = createActionButton(R.string.go_forward);
+        forward.setOnClickListener(v -> navigateForward());
+        actions.addView(forward);
+
+        Button home = createActionButton(R.string.go_home);
+        home.setOnClickListener(v -> loadHome());
+        actions.addView(home);
+
+        panel.addView(actions, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        return panel;
+    }
+
+    private Button createActionButton(int textRes) {
+        Button button = new Button(this);
+        button.setText(textRes);
+        button.setAllCaps(false);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+        );
+        params.setMargins(dp(3), 0, dp(3), 0);
+        button.setLayoutParams(params);
+        return button;
+    }
+
+    private void showNetworkError(String url, String detail) {
+        failedPageUrl = url;
+        if (networkErrorDetail != null) {
+            networkErrorDetail.setText(detail == null || detail.isEmpty()
+                    ? getString(R.string.network_error_message) : detail);
+        }
+        cancelShowTimeout();
+        if (networkErrorOverlay != null) networkErrorOverlay.setVisibility(View.VISIBLE);
+        webView.setVisibility(View.INVISIBLE);
+        progressBar.setVisibility(View.GONE);
+    }
+
+    private void hideNetworkError() {
+        failedPageUrl = null;
+        if (networkErrorOverlay != null) networkErrorOverlay.setVisibility(View.GONE);
+        webView.setVisibility(View.VISIBLE);
+    }
+
+    private void retryFailedPage() {
+        String url = failedPageUrl;
+        if (url == null || url.isEmpty()) url = webView.getUrl();
+        if (url == null || url.isEmpty()) url = HOME_URL;
+        hideNetworkError();
+        webView.loadUrl(url);
+    }
+
+    private void loadHome() {
+        hideNetworkError();
+        webView.loadUrl(HOME_URL);
+    }
+
+    private void navigateBack() {
+        if (webView.canGoBack()) {
+            hideNetworkError();
+            webView.goBack();
+        } else {
+            showNetworkError(failedPageUrl, getString(R.string.no_previous_page));
+        }
+    }
+
+    private void navigateForward() {
+        if (webView.canGoForward()) {
+            hideNetworkError();
+            webView.goForward();
+        } else {
+            showNetworkError(failedPageUrl, getString(R.string.no_next_page));
+        }
     }
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
@@ -207,6 +350,8 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                pageLoadFailed = false;
+                hideNetworkError();
                 // Hide the WebView immediately when a new page starts loading
                 // so the user never sees raw traditional Chinese text flash.
                 if (isTwkanHost(Uri.parse(url).getHost())) {
@@ -220,7 +365,51 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                injectSimplifier(url);
+                if (!pageLoadFailed) {
+                    injectSimplifier(url);
+                }
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request,
+                                        WebResourceError error) {
+                if (request.isForMainFrame()) {
+                    pageLoadFailed = true;
+                    String detail = getString(R.string.network_error_message);
+                    if (error != null && error.getDescription() != null) {
+                        detail = getString(R.string.network_error_detail,
+                                error.getDescription());
+                    }
+                    showNetworkError(request.getUrl() != null
+                                    ? request.getUrl().toString() : view.getUrl(),
+                            detail);
+                }
+            }
+
+            @SuppressWarnings("deprecation")
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description,
+                                        String failingUrl) {
+                if (failingUrl != null && failingUrl.equals(view.getUrl())) {
+                    pageLoadFailed = true;
+                    String detail = getString(R.string.network_error_message);
+                    if (description != null && !description.isEmpty()) {
+                        detail = getString(R.string.network_error_detail, description);
+                    }
+                    showNetworkError(failingUrl, detail);
+                }
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request,
+                                            WebResourceResponse errorResponse) {
+                if (request.isForMainFrame()) {
+                    pageLoadFailed = true;
+                    int statusCode = errorResponse != null ? errorResponse.getStatusCode() : 0;
+                    showNetworkError(request.getUrl() != null
+                                    ? request.getUrl().toString() : view.getUrl(),
+                            getString(R.string.http_error_detail, statusCode));
+                }
             }
         });
     }
@@ -390,6 +579,14 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (networkErrorOverlay != null && networkErrorOverlay.getVisibility() == View.VISIBLE) {
+            if (webView.canGoBack()) {
+                navigateBack();
+            } else {
+                super.onBackPressed();
+            }
+            return;
+        }
         if (webView.canGoBack()) {
             webView.goBack();
             return;
