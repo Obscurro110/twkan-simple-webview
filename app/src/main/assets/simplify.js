@@ -51,20 +51,54 @@
     });
   }
 
-  var PROMOTIONAL_TEXT_PATTERN = /记住首发网站域名|記住首發網站域名|本书首发|本書首發|无错章节|無錯章節|无乱序章节|無亂序章節|提供给你无错章节|提供給你無錯章節|记一下我们的域名|記一下我們的域名|希望读者记一下我们的域名|希望讀者記一下我們的域名|首发台湾小说网|首發臺灣小說網|(?:台湾小说网|臺灣小說網).{0,100}(?:twkan|𝕥𝕨𝕜𝕒𝕟|t̲)/i;
+  var PROMOTIONAL_TEXT_PATTERN = /记住首发网站域名|記住首發網站域名|本书首发|本書首發|无错章节|無錯章節|无乱序章节|無亂序章節|提供给你无错章节|提供給你無錯章節|记一下我们的域名|記一下我們的域名|希望读者记一下我们的域名|希望讀者記一下我們的域名|希望读者.{0,120}(?:域名|台湾小说网|臺灣小說網)|域名.{0,100}(?:台湾小说网|臺灣小說網|twkan|𝕥𝕨𝕜𝕒𝕟|𝑡𝑤𝑘𝑎𝑛|t̲)|(?:台湾小说网|臺灣小說網).{0,100}(?:域名|twkan|𝕥𝕨𝕜𝕒𝑛|𝑡𝑤𝑘𝑎𝑛|t̲)|首发台湾小说网|首發臺灣小說網/i;
 
   function removePromotionalText(root) {
     if (!root || !root.querySelectorAll) return;
 
-    var candidates = root.querySelectorAll("p, li, small, footer");
+    var candidates = root.querySelectorAll("p, li, small, footer, div, section, article");
     for (var i = candidates.length - 1; i >= 0; i--) {
       var candidate = candidates[i];
       if (candidate.getAttribute && candidate.getAttribute("data-twkan-reader-ui") === "true") continue;
       var text = (candidate.textContent || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "");
-      if (text.length > 0 && text.length <= 500 && PROMOTIONAL_TEXT_PATTERN.test(text)) {
-        candidate.remove();
+      if (text.length === 0 || text.length > 500 || !PROMOTIONAL_TEXT_PATTERN.test(text)) continue;
+
+      var nestedBlocks = candidate.querySelectorAll("p, li, small, footer, div, section, article");
+      var hasMeaningfulNestedBlock = false;
+      for (var n = 0; n < nestedBlocks.length; n++) {
+        if (nestedBlocks[n] !== candidate &&
+            (nestedBlocks[n].textContent || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "").length >= 40) {
+          hasMeaningfulNestedBlock = true;
+          break;
+        }
+      }
+      if (!hasMeaningfulNestedBlock) candidate.remove();
+    }
+
+    var paragraphNodes = root.querySelectorAll("p, li, small");
+    for (i = 0; i < paragraphNodes.length; i++) {
+      var start = paragraphNodes[i];
+      var windowText = "";
+      var windowNodes = [];
+      for (var w = i; w < paragraphNodes.length && w < i + 4; w++) {
+        var candidateNode = paragraphNodes[w];
+        if (candidateNode.parentElement && candidateNode.parentElement.closest &&
+            candidateNode.parentElement.closest("[data-twkan-reader-ui='true']")) break;
+        var candidateText = (candidateNode.textContent || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "");
+        if (candidateText.length === 0) continue;
+        windowText += candidateText;
+        windowNodes.push(candidateNode);
+        if (windowText.length > 500) break;
+        if (/域名|台湾小说网|臺灣小說網/.test(windowText) &&
+            /twkan|𝕥𝕨𝕜𝕒𝕟|𝑡𝑤𝑘𝑎𝑛|t̲/.test(windowText)) {
+          for (var removeIndex = 0; removeIndex < windowNodes.length; removeIndex++) {
+            if (windowNodes[removeIndex].parentNode) windowNodes[removeIndex].remove();
+          }
+          break;
+        }
       }
     }
+
 
     var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     var textNodes = [];
@@ -309,12 +343,13 @@
   function applyReadingSettings() {
     if (!readingSettingsInitialized) loadReadingSettings();
     var root = document.documentElement;
+    var body = document.body;
     root.style.setProperty("--twkan-reader-font-size", readingSettings.fontSize + "px");
     root.style.setProperty("--twkan-reader-line-height", readingSettings.lineHeight);
     root.style.setProperty("--twkan-reader-letter-spacing", readingSettings.letterSpacing + "px");
 
     var colors = {
-      site: "transparent",
+      site: "#ffffff",
       white: "#ffffff",
       warm: "#f7f0df",
       green: "#dcebdc",
@@ -322,9 +357,14 @@
       dark: "#202124"
     };
     root.style.setProperty("--twkan-reader-background", colors[readingSettings.background] || colors.site);
-    root.style.setProperty("--twkan-reader-foreground", readingSettings.background === "dark" ? "#eeeeee" : "inherit");
+    var foreground = readingSettings.background === "dark" ? "#f2f2f2" : "#202124";
+    root.style.setProperty("--twkan-reader-foreground", foreground);
     root.setAttribute("data-twkan-reader-bg", readingSettings.background);
-    if (document.body) document.body.setAttribute("data-twkan-reader-bg", readingSettings.background);
+    if (body) {
+      body.setAttribute("data-twkan-reader-bg", readingSettings.background);
+      body.style.setProperty("background-color", colors[readingSettings.background] || colors.site, "important");
+      body.style.setProperty("color", foreground, "important");
+    }
 
     var controls = document.querySelectorAll("[data-twkan-setting]");
     for (var i = 0; i < controls.length; i++) {
@@ -1105,8 +1145,11 @@
       }
       range.addEventListener("input", function () { commit(range.value); });
       number.addEventListener("change", function () { commit(number.value); });
-      number.addEventListener("input", function () {
-        if (number.value !== "") commit(number.value);
+      number.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") {
+          commit(number.value);
+          number.blur();
+        }
       });
       minus.addEventListener("click", function () {
         commit(Number(readingSettings[key]) - Number(step));
@@ -1215,6 +1258,11 @@
     // the real network URL even after history.replaceState changes location.
     contentRoot.setAttribute("data-twkan-reading-chapter", "true");
     contentRoot.setAttribute("data-twkan-reader-content", "true");
+    var surface = contentRoot.parentElement;
+    while (surface && surface !== document.body) {
+      surface.setAttribute("data-twkan-reader-surface", "true");
+      surface = surface.parentElement;
+    }
     document.body.setAttribute("data-twkan-reader-active", "true");
     contentRoot.setAttribute("data-chapter-url", initialChapterUrl);
     contentRoot.setAttribute("data-chapter-title", initialChapterTitle || "");
@@ -1350,13 +1398,13 @@
     '[id*="banner"] { display: none !important; }',
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
     'html[data-twkan-reader-bg], body[data-twkan-reader-bg] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
-    'body[data-twkan-reader-active="true"], body[data-twkan-reader-active="true"] > *, body[data-twkan-reader-active="true"] main, body[data-twkan-reader-active="true"] article { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
-    '[data-twkan-reader-content="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
-    '[data-twkan-reader-content="true"] * { background-color: transparent !important; }',
+    '[data-twkan-reader-surface="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    '[data-twkan-reading-chapter="true"], [data-twkan-reading-chapter="true"] *:not(img), .twkan-appended-chapter-body, .twkan-appended-chapter-body *:not(img) { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; opacity: 1 !important; }',
+    '[data-twkan-reading-chapter="true"] img, .twkan-appended-chapter-body img { background-color: transparent !important; }',
     '[data-twkan-reading-chapter="true"] * { box-sizing: border-box; }',
     '[data-twkan-reader-ui="true"] { font-family: sans-serif !important; letter-spacing: normal !important; line-height: normal !important; }',
-    '[data-twkan-reader-settings-toggle="true"] { position: fixed !important; right: max(12px, env(safe-area-inset-right)) !important; bottom: max(16px, calc(env(safe-area-inset-bottom) + 12px)) !important; z-index: 2147483000 !important; width: 48px !important; height: 48px !important; padding: 0 !important; border: 0 !important; border-radius: 10px !important; background: rgba(255,255,255,.94) !important; color: #333 !important; box-shadow: 0 2px 10px rgba(0,0,0,.22) !important; font-size: 18px !important; font-weight: 700 !important; }',
-    '[data-twkan-reader-settings="true"] { position: fixed !important; right: max(12px, env(safe-area-inset-right)) !important; bottom: max(72px, calc(env(safe-area-inset-bottom) + 68px)) !important; z-index: 2147482999 !important; width: min(310px, calc(100vw - 24px)) !important; max-height: calc(100vh - 112px) !important; overflow: auto !important; padding: 14px !important; border-radius: 10px !important; background: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; box-shadow: 0 4px 18px rgba(0,0,0,.28) !important; font-family: sans-serif !important; font-size: 14px !important; }',
+    '[data-twkan-reader-settings-toggle="true"] { position: fixed !important; right: 16px !important; bottom: 32px !important; z-index: 2147483000 !important; width: 48px !important; height: 48px !important; padding: 0 !important; border: 0 !important; border-radius: 10px !important; background: #ffffff !important; color: #202124 !important; box-shadow: 0 2px 10px rgba(0,0,0,.22) !important; font-size: 18px !important; font-weight: 700 !important; }',
+    '[data-twkan-reader-settings="true"] { position: fixed !important; right: 16px !important; bottom: 96px !important; z-index: 2147482999 !important; width: min(310px, calc(100vw - 24px)) !important; max-height: calc(100vh - 120px) !important; overflow: auto !important; padding: 14px !important; border-radius: 10px !important; border: 1px solid rgba(0,0,0,.14) !important; background: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; opacity: 1 !important; box-shadow: 0 4px 18px rgba(0,0,0,.28) !important; font-family: sans-serif !important; font-size: 14px !important; }',
     '.twkan-settings-title-row { display: flex !important; align-items: center !important; justify-content: space-between !important; margin-bottom: 10px !important; }',
     '.twkan-settings-close { border: 0 !important; background: transparent !important; padding: 0 5px !important; font-size: 24px !important; line-height: 1 !important; color: #555 !important; }',
     '.twkan-settings-row { display: grid !important; grid-template-columns: 76px minmax(0, 1fr) !important; align-items: center !important; gap: 7px !important; margin: 10px 0 !important; }',
