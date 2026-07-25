@@ -519,6 +519,135 @@
   }
 
 
+  function chapterTextContent(value) {
+    return (value || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]/g, "");
+  }
+
+  function normalizeChapterLayout(root) {
+    if (!root) return root;
+    if (root.style) {
+      root.style.setProperty("height", "auto", "important");
+      root.style.setProperty("min-height", "0", "important");
+      root.style.setProperty("max-height", "none", "important");
+      root.style.setProperty("margin-top", "0", "important");
+      root.style.setProperty("margin-bottom", "0", "important");
+      root.style.setProperty("padding-top", "0", "important");
+      root.style.setProperty("padding-bottom", "0", "important");
+    }
+
+    while (root.firstChild && root.firstChild.nodeType === Node.TEXT_NODE &&
+           chapterTextContent(root.firstChild.nodeValue).length === 0) {
+      root.firstChild.remove();
+    }
+    while (root.lastChild && root.lastChild.nodeType === Node.TEXT_NODE &&
+           chapterTextContent(root.lastChild.nodeValue).length === 0) {
+      root.lastChild.remove();
+    }
+
+    while (root.firstChild && root.firstChild.nodeType === Node.ELEMENT_NODE &&
+           root.firstChild.tagName === "BR") {
+      root.firstChild.remove();
+    }
+    while (root.lastChild && root.lastChild.nodeType === Node.ELEMENT_NODE &&
+           root.lastChild.tagName === "BR") {
+      root.lastChild.remove();
+    }
+
+    var all = root.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.style) {
+        // Site templates sometimes use spacer styles inside the article.
+        // Keep typography, but remove dimensions and vertical layout gaps.
+        el.style.setProperty("height", "auto", "important");
+        el.style.setProperty("min-height", "0", "important");
+        el.style.setProperty("max-height", "none", "important");
+        el.style.setProperty("margin-top", "0", "important");
+        el.style.setProperty("margin-bottom", "0", "important");
+        el.style.setProperty("padding-top", "0", "important");
+        el.style.setProperty("padding-bottom", "0", "important");
+      }
+    }
+
+    var blocks = root.querySelectorAll("p, div, section, article, header, footer, h1, h2, h3, h4, h5, h6");
+    for (i = blocks.length - 1; i >= 0; i--) {
+      var block = blocks[i];
+      if (chapterTextContent(block.textContent).length === 0 &&
+          !block.querySelector("img, video, audio, canvas, iframe, object, embed, a")) {
+        block.remove();
+      }
+    }
+
+    // Collapse runs of spacer <br> elements to one line break, even when
+    // source formatting inserts whitespace text nodes between them.
+    var breaks = root.querySelectorAll("br");
+    for (i = breaks.length - 1; i >= 0; i--) {
+      var next = breaks[i].nextSibling;
+      while (next && next.nodeType === Node.TEXT_NODE && chapterTextContent(next.nodeValue).length === 0) {
+        next = next.nextSibling;
+      }
+      if (next && next.nodeType === Node.ELEMENT_NODE && next.tagName === "BR") {
+        breaks[i].remove();
+      }
+    }
+
+    // A leading or trailing break in a block is only a layout spacer. Ignore
+    // indentation whitespace while looking for the first/last real child.
+    var containers = root.querySelectorAll("p, div, section, article, h1, h2, h3, h4, h5, h6");
+    containers = Array.prototype.slice.call(containers);
+    containers.push(root);
+    for (i = 0; i < containers.length; i++) {
+      var container = containers[i];
+      var first = container.firstChild;
+      while (first && first.nodeType === Node.TEXT_NODE && chapterTextContent(first.nodeValue).length === 0) {
+        var nextFirst = first.nextSibling;
+        first.remove();
+        first = nextFirst;
+      }
+      while (first && first.nodeType === Node.ELEMENT_NODE && first.tagName === "BR") {
+        var afterFirst = first.nextSibling;
+        first.remove();
+        first = afterFirst;
+        while (first && first.nodeType === Node.TEXT_NODE && chapterTextContent(first.nodeValue).length === 0) {
+          var afterWhitespace = first.nextSibling;
+          first.remove();
+          first = afterWhitespace;
+        }
+      }
+
+      var last = container.lastChild;
+      while (last && last.nodeType === Node.TEXT_NODE && chapterTextContent(last.nodeValue).length === 0) {
+        var previousLast = last.previousSibling;
+        last.remove();
+        last = previousLast;
+      }
+      while (last && last.nodeType === Node.ELEMENT_NODE && last.tagName === "BR") {
+        var beforeLast = last.previousSibling;
+        last.remove();
+        last = beforeLast;
+        while (last && last.nodeType === Node.TEXT_NODE && chapterTextContent(last.nodeValue).length === 0) {
+          var beforeWhitespace = last.previousSibling;
+          last.remove();
+          last = beforeWhitespace;
+        }
+      }
+    }
+
+    // Removing <br> can turn a previously non-empty spacer block into an
+    // empty paragraph. Run the check once more after break normalization.
+    var finalBlocks = root.querySelectorAll("p, div, section, article, header, footer, h1, h2, h3, h4, h5, h6");
+    for (i = finalBlocks.length - 1; i >= 0; i--) {
+      var finalBlock = finalBlocks[i];
+      if (chapterTextContent(finalBlock.textContent).length === 0 &&
+          !finalBlock.querySelector("img, video, audio, canvas, iframe, object, embed, a")) {
+        finalBlock.remove();
+      }
+    }
+
+    return root;
+  }
+
+
   function sanitizeChapterContent(root, baseUrl) {
     var unwanted = root.querySelectorAll(
       "script, style, noscript, iframe, object, embed, form, nav, " +
@@ -571,6 +700,7 @@
     var title = getChapterTitle(doc, root);
     var clone = sanitizeChapterContent(root.cloneNode(true), url);
     removeDuplicateChapterTitle(clone, title);
+    normalizeChapterLayout(clone);
     var cleanText = (clone.textContent || "").replace(/\s+/g, "");
     if (cleanText.length < 20) throw new Error("Chapter body is empty");
     return {
@@ -805,6 +935,7 @@
     infiniteInitialized = true;
     initialChapterUrl = normalizeUrl(sourceUrlFor(document));
     initialChapterTitle = getChapterTitle(document, contentRoot) || document.title;
+    normalizeChapterLayout(contentRoot);
     currentReadingUrl = initialChapterUrl;
     nextChapterUrl = normalizeUrl(nextInfo.url);
     appendedUrls[initialChapterUrl] = true;
@@ -944,10 +1075,14 @@
     '[class*="banner"] { display: none !important; }',
     '[id*="banner"] { display: none !important; }',
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
-    '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; }',
-    '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 48px auto 30px !important; background: rgba(127,127,127,.32) !important; }',
-    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 10px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
-    '.twkan-appended-chapter-body { display: block !important; margin: 0 !important; padding: 0 !important; }',
+    '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; }',
+    '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 28px auto 18px !important; background: rgba(127,127,127,.32) !important; }',
+    '[data-twkan-reading-chapter="true"] { height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important; }',
+    '[data-twkan-reading-chapter="true"] > h1, [data-twkan-reading-chapter="true"] > h2, [data-twkan-reading-chapter="true"] > h3 { margin-top: 0 !important; margin-bottom: 6px !important; padding-top: 0 !important; padding-bottom: 0 !important; height: auto !important; min-height: 0 !important; }',
+    '[data-twkan-reading-chapter="true"] p, [data-twkan-reading-chapter="true"] div { height: auto !important; min-height: 0 !important; max-height: none !important; padding-top: 0 !important; padding-bottom: 0 !important; }',
+    '[data-twkan-reading-chapter="true"] p { margin-top: 0 !important; margin-bottom: 1em !important; }',
+    '.twkan-appended-chapter-title { display: block !important; margin: 0 0 6px !important; padding: 0 12px !important; text-align: center !important; font-size: 1.35em !important; line-height: 1.55 !important; }',
+    '.twkan-appended-chapter-body { display: block !important; margin: 0 !important; padding: 0 !important; height: auto !important; min-height: 0 !important; }',
     '.twkan-appended-chapter-body > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }',
     '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
     '.twkan-infinite-status { display: block; padding: 24px 12px !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
