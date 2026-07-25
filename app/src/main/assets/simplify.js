@@ -51,7 +51,7 @@
     });
   }
 
-  var PROMOTIONAL_TEXT_PATTERN = /记住首发网站域名|記住首發網站域名|本书首发|本書首發|无错章节|無錯章節|无乱序章节|無亂序章節|提供给你无错章节|提供給你無錯章節|首发台湾小说网|首發臺灣小說網|(?:首发|首發).{0,80}(?:twkan|𝕥𝕨𝕜𝕒𝕟|t̲)/i;
+  var PROMOTIONAL_TEXT_PATTERN = /记住首发网站域名|記住首發網站域名|本书首发|本書首發|无错章节|無錯章節|无乱序章节|無亂序章節|提供给你无错章节|提供給你無錯章節|记一下我们的域名|記一下我們的域名|希望读者记一下我们的域名|希望讀者記一下我們的域名|首发台湾小说网|首發臺灣小說網|(?:台湾小说网|臺灣小說網).{0,100}(?:twkan|𝕥𝕨𝕜𝕒𝕟|t̲)/i;
 
   function removePromotionalText(root) {
     if (!root || !root.querySelectorAll) return;
@@ -324,6 +324,7 @@
     root.style.setProperty("--twkan-reader-background", colors[readingSettings.background] || colors.site);
     root.style.setProperty("--twkan-reader-foreground", readingSettings.background === "dark" ? "#eeeeee" : "inherit");
     root.setAttribute("data-twkan-reader-bg", readingSettings.background);
+    if (document.body) document.body.setAttribute("data-twkan-reader-bg", readingSettings.background);
 
     var controls = document.querySelectorAll("[data-twkan-setting]");
     for (var i = 0; i < controls.length; i++) {
@@ -336,10 +337,16 @@
   }
 
   function updateReadingSetting(key, value) {
-    if (key === "fontSize") readingSettings.fontSize = Math.max(14, Math.min(32, Number(value)));
-    if (key === "lineHeight") readingSettings.lineHeight = Math.max(1.3, Math.min(3, Number(value)));
-    if (key === "letterSpacing") readingSettings.letterSpacing = Math.max(-1, Math.min(4, Number(value)));
-    if (key === "background" && /^(site|white|warm|green|gray|dark)$/.test(value)) readingSettings.background = value;
+    var numeric;
+    if (key === "background") {
+      if (/^(site|white|warm|green|gray|dark)$/.test(value)) readingSettings.background = value;
+    } else {
+      numeric = Number(value);
+      if (!isFinite(numeric)) return;
+      if (key === "fontSize") readingSettings.fontSize = Math.round(Math.max(14, Math.min(32, numeric)));
+      if (key === "lineHeight") readingSettings.lineHeight = Math.round(Math.max(1.3, Math.min(3, numeric)) * 10) / 10;
+      if (key === "letterSpacing") readingSettings.letterSpacing = Math.round(Math.max(-1, Math.min(4, numeric)) * 10) / 10;
+    }
     saveReadingSettings();
     applyReadingSettings();
   }
@@ -992,6 +999,7 @@
 
         var body = document.createElement("div");
         body.className = "twkan-appended-chapter-body";
+        body.setAttribute("data-twkan-reader-content", "true");
         body.innerHTML = chapter.html;
         section.appendChild(body);
 
@@ -1054,27 +1062,67 @@
     panel.appendChild(titleRow);
 
     function addRange(key, labelText, min, max, step, unit) {
-      var row = document.createElement("label");
+      var row = document.createElement("div");
       row.className = "twkan-settings-row";
       var caption = document.createElement("span");
       caption.textContent = labelText;
-      var value = document.createElement("output");
-      value.className = "twkan-settings-value";
-      var input = document.createElement("input");
-      input.type = "range";
-      input.min = min;
-      input.max = max;
-      input.step = step;
-      input.setAttribute("data-twkan-setting", key);
-      input.addEventListener("input", function () {
-        updateReadingSetting(key, input.value);
-        value.textContent = input.value + unit;
+      var controls = document.createElement("div");
+      controls.className = "twkan-settings-control";
+
+      var minus = document.createElement("button");
+      minus.type = "button";
+      minus.textContent = "−";
+      minus.title = "减小" + labelText;
+      minus.setAttribute("aria-label", "减小" + labelText);
+      minus.className = "twkan-settings-step";
+
+      var range = document.createElement("input");
+      range.type = "range";
+      range.min = min;
+      range.max = max;
+      range.step = step;
+      range.setAttribute("data-twkan-setting", key);
+
+      var number = document.createElement("input");
+      number.type = "number";
+      number.min = min;
+      number.max = max;
+      number.step = step;
+      number.inputMode = "decimal";
+      number.setAttribute("data-twkan-setting", key);
+      number.setAttribute("aria-label", labelText);
+      number.className = "twkan-settings-number";
+
+      var plus = document.createElement("button");
+      plus.type = "button";
+      plus.textContent = "+";
+      plus.title = "增大" + labelText;
+      plus.setAttribute("aria-label", "增大" + labelText);
+      plus.className = "twkan-settings-step";
+
+      function commit(value) {
+        updateReadingSetting(key, value);
+      }
+      range.addEventListener("input", function () { commit(range.value); });
+      number.addEventListener("change", function () { commit(number.value); });
+      number.addEventListener("input", function () {
+        if (number.value !== "") commit(number.value);
       });
+      minus.addEventListener("click", function () {
+        commit(Number(readingSettings[key]) - Number(step));
+      });
+      plus.addEventListener("click", function () {
+        commit(Number(readingSettings[key]) + Number(step));
+      });
+
+      controls.appendChild(minus);
+      controls.appendChild(range);
+      controls.appendChild(number);
+      controls.appendChild(plus);
       row.appendChild(caption);
-      row.appendChild(value);
-      row.appendChild(input);
+      row.appendChild(controls);
       panel.appendChild(row);
-      return { input: input, value: value };
+      return { input: number, range: range };
     }
 
     var font = addRange("fontSize", "字体大小", 14, 32, 1, "px");
@@ -1123,12 +1171,13 @@
     applyReadingSettings();
 
     function updateLabels() {
-      font.value.textContent = readingSettings.fontSize + "px";
       font.input.value = readingSettings.fontSize;
-      line.value.textContent = readingSettings.lineHeight;
+      font.range.value = readingSettings.fontSize;
       line.input.value = readingSettings.lineHeight;
-      spacing.value.textContent = readingSettings.letterSpacing + "px";
+      line.range.value = readingSettings.lineHeight;
       spacing.input.value = readingSettings.letterSpacing;
+      spacing.range.value = readingSettings.letterSpacing;
+      color.value = readingSettings.background;
     }
     updateLabels();
   }
@@ -1165,6 +1214,7 @@
     // Treat the original chapter as the first tracked section. Its URL remains
     // the real network URL even after history.replaceState changes location.
     contentRoot.setAttribute("data-twkan-reading-chapter", "true");
+    contentRoot.setAttribute("data-twkan-reader-content", "true");
     document.body.setAttribute("data-twkan-reader-active", "true");
     contentRoot.setAttribute("data-chapter-url", initialChapterUrl);
     contentRoot.setAttribute("data-chapter-title", initialChapterTitle || "");
@@ -1299,16 +1349,22 @@
     '[class*="banner"] { display: none !important; }',
     '[id*="banner"] { display: none !important; }',
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
-    'body[data-twkan-reader-active="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    'html[data-twkan-reader-bg], body[data-twkan-reader-bg] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    'body[data-twkan-reader-active="true"], body[data-twkan-reader-active="true"] > *, body[data-twkan-reader-active="true"] main, body[data-twkan-reader-active="true"] article { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    '[data-twkan-reader-content="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
+    '[data-twkan-reader-content="true"] * { background-color: transparent !important; }',
     '[data-twkan-reading-chapter="true"] * { box-sizing: border-box; }',
     '[data-twkan-reader-ui="true"] { font-family: sans-serif !important; letter-spacing: normal !important; line-height: normal !important; }',
-    '[data-twkan-reader-settings-toggle="true"] { position: fixed !important; right: 10px !important; bottom: 22px !important; z-index: 2147483000 !important; width: 48px !important; height: 48px !important; padding: 0 !important; border: 0 !important; border-radius: 10px !important; background: rgba(255,255,255,.94) !important; color: #333 !important; box-shadow: 0 2px 10px rgba(0,0,0,.22) !important; font-size: 18px !important; font-weight: 700 !important; }',
-    '[data-twkan-reader-settings="true"] { position: fixed !important; right: 10px !important; bottom: 78px !important; z-index: 2147482999 !important; width: min(310px, calc(100vw - 20px)) !important; max-height: calc(100vh - 100px) !important; overflow: auto !important; padding: 14px !important; border-radius: 10px !important; background: rgba(255,255,255,.98) !important; color: #222 !important; box-shadow: 0 4px 18px rgba(0,0,0,.28) !important; font-family: sans-serif !important; font-size: 14px !important; }',
+    '[data-twkan-reader-settings-toggle="true"] { position: fixed !important; right: max(12px, env(safe-area-inset-right)) !important; bottom: max(16px, calc(env(safe-area-inset-bottom) + 12px)) !important; z-index: 2147483000 !important; width: 48px !important; height: 48px !important; padding: 0 !important; border: 0 !important; border-radius: 10px !important; background: rgba(255,255,255,.94) !important; color: #333 !important; box-shadow: 0 2px 10px rgba(0,0,0,.22) !important; font-size: 18px !important; font-weight: 700 !important; }',
+    '[data-twkan-reader-settings="true"] { position: fixed !important; right: max(12px, env(safe-area-inset-right)) !important; bottom: max(72px, calc(env(safe-area-inset-bottom) + 68px)) !important; z-index: 2147482999 !important; width: min(310px, calc(100vw - 24px)) !important; max-height: calc(100vh - 112px) !important; overflow: auto !important; padding: 14px !important; border-radius: 10px !important; background: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; box-shadow: 0 4px 18px rgba(0,0,0,.28) !important; font-family: sans-serif !important; font-size: 14px !important; }',
     '.twkan-settings-title-row { display: flex !important; align-items: center !important; justify-content: space-between !important; margin-bottom: 10px !important; }',
     '.twkan-settings-close { border: 0 !important; background: transparent !important; padding: 0 5px !important; font-size: 24px !important; line-height: 1 !important; color: #555 !important; }',
-    '.twkan-settings-row { display: grid !important; grid-template-columns: 76px 1fr 44px !important; align-items: center !important; gap: 7px !important; margin: 10px 0 !important; }',
-    '.twkan-settings-row input[type="range"] { width: 100% !important; min-width: 0 !important; }',
-    '.twkan-settings-row select { grid-column: 2 / 4 !important; min-width: 0 !important; padding: 5px !important; }',
+    '.twkan-settings-row { display: grid !important; grid-template-columns: 76px minmax(0, 1fr) !important; align-items: center !important; gap: 7px !important; margin: 10px 0 !important; }',
+    '.twkan-settings-control { display: grid !important; grid-template-columns: 30px minmax(40px, 1fr) 62px 30px !important; align-items: center !important; gap: 4px !important; min-width: 0 !important; }',
+    '.twkan-settings-step { width: 30px !important; height: 30px !important; padding: 0 !important; border: 1px solid #aaa !important; border-radius: 5px !important; background: rgba(255,255,255,.7) !important; color: #222 !important; font-size: 20px !important; line-height: 28px !important; }',
+    '.twkan-settings-control input[type="range"] { width: 100% !important; min-width: 40px !important; }',
+    '.twkan-settings-number { width: 62px !important; min-width: 0 !important; padding: 5px 3px !important; border: 1px solid #aaa !important; border-radius: 5px !important; background: rgba(255,255,255,.82) !important; color: #222 !important; text-align: center !important; font-size: 13px !important; }',
+    '.twkan-settings-row select { grid-column: 2 !important; min-width: 0 !important; width: 100% !important; padding: 5px !important; }',
     '.twkan-settings-value { text-align: right !important; color: #666 !important; font-variant-numeric: tabular-nums !important; }',
     '.twkan-settings-reset { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #bbb !important; border-radius: 6px !important; background: #f5f5f5 !important; color: #222 !important; }',
 
