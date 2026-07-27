@@ -44,10 +44,6 @@ public class MainActivity extends Activity {
     private static final String HOME_URL = "https://twkan.com/";
     private static final String SIMPLIFY_BRIDGE_NAME = "TwkanBridge";
     private static final int SHOW_TIMEOUT_MS = 1500;
-    private static final int READING_SYNC_DELAY_MS = 500;
-    private static final String MOBILE_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
     /** Ad/tracker domains to block at the network layer. */
     private static final Set<String> AD_HOSTS = new HashSet<>(Arrays.asList(
@@ -76,7 +72,15 @@ public class MainActivity extends Activity {
             "moatads.com"
     ));
 
-    /** Empty 1×1 transparent GIF returned for blocked image requests. */
+    private static String getCompatibleUserAgent(WebSettings settings) {
+        String userAgent = settings.getUserAgentString();
+        if (userAgent == null || userAgent.isEmpty()) return null;
+        // Keep the actual Android WebView/Chrome version and only remove the
+        // WebView marker. A fabricated Chrome version can trigger bot checks.
+        return userAgent.replaceAll("; wv\\)", ")")
+                .replaceAll("\\s+wv(?:\\s|$)", " ");
+    }
+
     private static final byte[] EMPTY_GIF = {
         0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,(byte)0x80,
         0x00,0x00,(byte)0xff,(byte)0xff,(byte)0xff,0x00,0x00,0x00,0x21,
@@ -102,7 +106,6 @@ public class MainActivity extends Activity {
     }
 
     private WebView webView;
-    private WebView readingSyncWebView;
     private ProgressBar progressBar;
     private View networkErrorOverlay;
     private TextView networkErrorDetail;
@@ -111,10 +114,6 @@ public class MainActivity extends Activity {
     private String simplifierScript;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable showPageRunnable;
-    private Runnable readingSyncRunnable;
-    private String pendingReadingSyncUrl;
-    private String activeReadingSyncUrl;
-    private String lastReadingSyncUrl;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -293,9 +292,12 @@ public class MainActivity extends Activity {
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     private void configureWebView() {
         WebSettings settings = webView.getSettings();
-        // Override User-Agent to remove the "wv" WebView marker that Cloudflare detects as a bot.
-        // Use a standard Chrome Mobile UA string instead.
-        settings.setUserAgentString(MOBILE_USER_AGENT);
+        // Keep the device WebView's real Chrome version and remove only the
+        // WebView marker. This is more consistent with the actual browser.
+        String compatibleUserAgent = getCompatibleUserAgent(settings);
+        if (compatibleUserAgent != null) {
+            settings.setUserAgentString(compatibleUserAgent);
+        }
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
@@ -427,80 +429,14 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Load a chapter in an invisible WebView only after the reader actually
-     * reaches it. The sync WebView shares CookieManager/WebStorage with the
-     * visible WebView, so the site's own visit/read-history scripts can run
-     * without navigating away from infinite-scroll mode.
+     * Reading history is already persisted locally by simplify.js and the
+     * chapter-change event is dispatched in the visible WebView. Do not open a
+     * second hidden WebView here: that extra navigation can trigger Cloudflare
+     * verification repeatedly and is not required for the local history page.
      */
-    @SuppressLint("SetJavaScriptEnabled")
     private void syncWebsiteReadingRecord(String url) {
-        if (url == null || url.isEmpty()) return;
-        Uri uri = Uri.parse(url);
-        if (!isTwkanHost(uri.getHost())) return;
-        if (url.equals(lastReadingSyncUrl)
-                || url.equals(pendingReadingSyncUrl)
-                || url.equals(activeReadingSyncUrl)) return;
-
-        pendingReadingSyncUrl = url;
-        if (readingSyncRunnable != null) {
-            mainHandler.removeCallbacks(readingSyncRunnable);
-        }
-        readingSyncRunnable = () -> {
-            String targetUrl = pendingReadingSyncUrl;
-            pendingReadingSyncUrl = null;
-            if (targetUrl == null || targetUrl.equals(lastReadingSyncUrl) || isFinishing()) return;
-
-            if (readingSyncWebView == null) {
-                readingSyncWebView = new WebView(MainActivity.this);
-                WebSettings syncSettings = readingSyncWebView.getSettings();
-                syncSettings.setUserAgentString(MOBILE_USER_AGENT);
-                syncSettings.setJavaScriptEnabled(true);
-                syncSettings.setDomStorageEnabled(true);
-                syncSettings.setDatabaseEnabled(true);
-                CookieManager.getInstance().setAcceptCookie(true);
-                CookieManager.getInstance().setAcceptThirdPartyCookies(readingSyncWebView, true);
-                readingSyncWebView.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public WebResourceResponse shouldInterceptRequest(
-                            WebView view, WebResourceRequest request) {
-                        String requestUrl = request.getUrl() != null
-                                ? request.getUrl().toString() : null;
-                        if (isAdUrl(requestUrl)) {
-                            return new WebResourceResponse(
-                                    "text/plain", "UTF-8",
-                                    new java.io.ByteArrayInputStream(new byte[0]));
-                        }
-                        return null;
-                    }
-
-                    @Override
-                    public void onPageStarted(WebView view, String loadedUrl, Bitmap favicon) {
-                        if (loadedUrl != null && isTwkanHost(Uri.parse(loadedUrl).getHost())) {
-                            activeReadingSyncUrl = loadedUrl;
-                        }
-                    }
-
-                    @Override
-                    public void onPageFinished(WebView view, String loadedUrl) {
-                        if (loadedUrl != null && isTwkanHost(Uri.parse(loadedUrl).getHost())) {
-                            if (activeReadingSyncUrl != null) {
-                                lastReadingSyncUrl = activeReadingSyncUrl;
-                            }
-                            CookieManager.getInstance().flush();
-                            // Give late site scripts a moment, then free page memory.
-                            mainHandler.postDelayed(() -> {
-                                if (readingSyncWebView != null) {
-                                    activeReadingSyncUrl = null;
-                                    readingSyncWebView.loadUrl("about:blank");
-                                }
-                            }, 3000);
-                        }
-                    }
-                });
-            }
-            readingSyncWebView.loadUrl(targetUrl);
-        };
-        mainHandler.postDelayed(readingSyncRunnable, READING_SYNC_DELAY_MS);
+        // Intentionally no-op. Keep the bridge method for compatibility with
+        // older injected scripts, but never create a second network session.
     }
 
 
@@ -597,9 +533,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         webView.onPause();
-        if (readingSyncWebView != null) {
-            readingSyncWebView.onPause();
-        }
         super.onPause();
     }
 
@@ -607,23 +540,12 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
-        if (readingSyncWebView != null) {
-            readingSyncWebView.onResume();
-        }
     }
 
     @Override
     protected void onDestroy() {
         if (showPageRunnable != null) {
             mainHandler.removeCallbacks(showPageRunnable);
-        }
-        if (readingSyncRunnable != null) {
-            mainHandler.removeCallbacks(readingSyncRunnable);
-        }
-        if (readingSyncWebView != null) {
-            readingSyncWebView.stopLoading();
-            readingSyncWebView.destroy();
-            readingSyncWebView = null;
         }
         if (webView != null) {
             webView.destroy();

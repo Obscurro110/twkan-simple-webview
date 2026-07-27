@@ -288,7 +288,7 @@
   }
 
   // ─── Infinite Chapter Reader + 3-chapter memory prefetch ──────────────────
-  var PREFETCH_AHEAD = 3;
+  var PREFETCH_AHEAD = 0;
   var chapterCache = Object.create(null);
   var chapterRequests = Object.create(null);
   var appendedUrls = Object.create(null);
@@ -302,7 +302,9 @@
   var initialChapterTitle = null;
   var currentReadingUrl = null;
   var readingTrackerTimer = null;
-  var READING_SETTINGS_KEY = "twkan:readingSettings";
+  var cloudflareBlockedUrl = null;
+  var cloudflareBlockedAt = 0;
+
   var readingSettings = {
     fontSize: 20,
     lineHeight: 1.9,
@@ -877,7 +879,7 @@
 
     chapterRequests[url] = fetch(url, {
       credentials: "include",
-      cache: "force-cache",
+      cache: "default",
       redirect: "follow"
     })
       .then(function (response) {
@@ -885,7 +887,11 @@
         return response.text();
       })
       .then(function (html) {
-        if (isCloudflareChallenge(html)) throw new Error("Cloudflare challenge");
+        if (isCloudflareChallenge(html)) {
+          cloudflareBlockedUrl = url;
+          cloudflareBlockedAt = Date.now();
+          throw new Error("Cloudflare challenge");
+        }
         var doc = new DOMParser().parseFromString(html, "text/html");
         doc.__twkanSourceUrl = url;
         var chapter = extractChapter(doc, url);
@@ -1012,6 +1018,11 @@
       setLoadingState("已到最后一章", false);
       return Promise.resolve(null);
     }
+    if (cloudflareBlockedUrl === requestedUrl && Date.now() - cloudflareBlockedAt < 10 * 60 * 1000) {
+      setLoadingState("请在当前页面完成网站验证，正在打开下一章…", true);
+      window.location.href = requestedUrl;
+      return Promise.resolve(null);
+    }
 
     appendingChapter = true;
     setLoadingState("正在加载下一章…", false);
@@ -1060,9 +1071,14 @@
         }
         return section;
       })
-      .catch(function () {
+      .catch(function (error) {
         appendingChapter = false;
-        setLoadingState("下一章加载失败，点这里重试", true);
+        if (cloudflareBlockedUrl === requestedUrl || /Cloudflare/i.test(error && error.message || "")) {
+          cloudflareBlockedUrl = requestedUrl;
+          setLoadingState("网站正在验证，请先在当前页面完成验证后，再点击这里重试", true);
+        } else {
+          setLoadingState("下一章加载失败，点这里重试", true);
+        }
         return null;
       });
   }
