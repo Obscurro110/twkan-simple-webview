@@ -43,6 +43,9 @@ public class MainActivity extends Activity {
     private static final String TAG = "TwkanSimple";
     private static final String HOME_URL = "https://twkan.com/";
     private static final String SIMPLIFY_BRIDGE_NAME = "TwkanBridge";
+    private static final String READER_PREFS_NAME = "twkan_reader_state";
+    private static final String PREF_READING_SETTINGS = "reading_settings";
+    private static final String PREF_READING_POSITION = "reading_position";
     private static final int SHOW_TIMEOUT_MS = 1500;
 
     /** Ad/tracker domains to block at the network layer. */
@@ -570,6 +573,37 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void syncReadingRecord(String url) {
             mainHandler.post(() -> syncWebsiteReadingRecord(url));
+        }
+
+        @JavascriptInterface
+        public String loadReaderState(String key) {
+            String preferenceKey;
+            if ("settings".equals(key)) {
+                preferenceKey = PREF_READING_SETTINGS;
+            } else if ("position".equals(key)) {
+                preferenceKey = PREF_READING_POSITION;
+            } else {
+                return "";
+            }
+            return getSharedPreferences(READER_PREFS_NAME, MODE_PRIVATE)
+                    .getString(preferenceKey, "");
+        }
+
+        @JavascriptInterface
+        public void saveReaderState(String key, String value) {
+            if (value == null) return;
+            String preferenceKey;
+            if ("settings".equals(key)) {
+                preferenceKey = PREF_READING_SETTINGS;
+            } else if ("position".equals(key)) {
+                preferenceKey = PREF_READING_POSITION;
+            } else {
+                return;
+            }
+            getSharedPreferences(READER_PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString(preferenceKey, value)
+                    .apply();
         }
 
         @JavascriptInterface

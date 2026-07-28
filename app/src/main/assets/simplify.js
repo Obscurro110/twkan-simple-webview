@@ -135,6 +135,10 @@
   var runKey       = "__twkanSimplifierRun";
   var converting   = false;
   var pageReadySent = false; // only notify Java once per page load
+  var READING_SETTINGS_KEY = "twkan:readingSettings";
+  var READING_POSITION_KEY = "twkan:readingPosition";
+  var CLOUDFLARE_BLOCKED_KEY = "twkan:cloudflareBlocked";
+
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
   function canConvertText(text) {
@@ -312,7 +316,7 @@
     background: "site"
   };
   var readingSettingsInitialized = false;
-
+  var readingPositionRestoreTimer = null;
 
 
   var CONTENT_SELECTORS = [
@@ -326,20 +330,53 @@
   ];
 
   function loadReadingSettings() {
+    if (readingSettingsInitialized) return;
+    var stored = null;
     try {
-      var stored = JSON.parse(localStorage.getItem(READING_SETTINGS_KEY) || "null");
-      if (stored && typeof stored === "object") {
-        if (isFinite(Number(stored.fontSize))) readingSettings.fontSize = Math.max(14, Math.min(32, Number(stored.fontSize)));
-        if (isFinite(Number(stored.lineHeight))) readingSettings.lineHeight = Math.max(1.3, Math.min(3, Number(stored.lineHeight)));
-        if (isFinite(Number(stored.letterSpacing))) readingSettings.letterSpacing = Math.max(-1, Math.min(4, Number(stored.letterSpacing)));
-        if (/^(site|white|warm|green|gray|dark)$/.test(stored.background)) readingSettings.background = stored.background;
-      }
-    } catch (e) { /* use defaults */ }
+      var sessionRaw = sessionStorage.getItem(READING_SETTINGS_KEY);
+      if (sessionRaw) stored = JSON.parse(sessionRaw);
+    } catch (e) { /* try localStorage */ }
+    if (!stored) {
+      try {
+        var localRaw = localStorage.getItem(READING_SETTINGS_KEY);
+        if (localRaw) stored = JSON.parse(localRaw);
+      } catch (e) { /* try native state */ }
+    }
+    if (!stored) {
+      try {
+        if (typeof window.TwkanBridge.loadReaderState === "function") {
+          var nativeRaw = window.TwkanBridge.loadReaderState("settings");
+          if (nativeRaw) stored = JSON.parse(nativeRaw);
+        }
+      } catch (e) { /* use defaults */ }
+    }
+    if (stored && typeof stored === "object") {
+      if (isFinite(Number(stored.fontSize))) readingSettings.fontSize = Math.max(14, Math.min(32, Number(stored.fontSize)));
+      if (isFinite(Number(stored.lineHeight))) readingSettings.lineHeight = Math.max(1.3, Math.min(3, Number(stored.lineHeight)));
+      if (isFinite(Number(stored.letterSpacing))) readingSettings.letterSpacing = Math.max(-1, Math.min(4, Number(stored.letterSpacing)));
+      if (/^(site|white|warm|green|gray|dark)$/.test(stored.background)) readingSettings.background = stored.background;
+    }
     readingSettingsInitialized = true;
+    if (stored) saveReadingSettings();
   }
 
   function saveReadingSettings() {
-    try { localStorage.setItem(READING_SETTINGS_KEY, JSON.stringify(readingSettings)); } catch (e) { /* ignore */ }
+    var payload = {
+      version: 1,
+      fontSize: readingSettings.fontSize,
+      lineHeight: readingSettings.lineHeight,
+      letterSpacing: readingSettings.letterSpacing,
+      background: readingSettings.background,
+      updatedAt: Date.now()
+    };
+    var serialized = JSON.stringify(payload);
+    try { localStorage.setItem(READING_SETTINGS_KEY, serialized); } catch (e) { /* ignore */ }
+    try { sessionStorage.setItem(READING_SETTINGS_KEY, serialized); } catch (e) { /* ignore */ }
+    try {
+      if (typeof window.TwkanBridge.saveReaderState === "function") {
+        window.TwkanBridge.saveReaderState("settings", serialized);
+      }
+    } catch (e) { /* ignore */ }
   }
 
   function applyReadingSettings() {
@@ -397,6 +434,98 @@
     readingSettings = { fontSize: 20, lineHeight: 1.9, letterSpacing: 0, background: "site" };
     saveReadingSettings();
     applyReadingSettings();
+  }
+
+
+  function saveReadingPosition() {
+    if (!infiniteInitialized) return;
+    var scrollY = window.scrollY || window.pageYOffset || 0;
+    var chapterElement = null;
+    var chapters = document.querySelectorAll("[data-twkan-reading-chapter='true']");
+    for (var i = 0; i < chapters.length; i++) {
+      if (normalizeUrl(chapters[i].getAttribute("data-chapter-url")) === currentReadingUrl) {
+        chapterElement = chapters[i];
+        break;
+      }
+    }
+    var chapterTop = chapterElement ? chapterElement.getBoundingClientRect().top + scrollY : 0;
+    var position = {
+      pageUrl: window.location.href.split("#")[0],
+      chapterUrl: currentReadingUrl || initialChapterUrl || "",
+      scrollY: scrollY,
+      chapterOffset: Math.max(0, scrollY - chapterTop),
+      updatedAt: Date.now()
+    };
+    var serialized = JSON.stringify(position);
+    try { localStorage.setItem(READING_POSITION_KEY, serialized); } catch (e) { /* ignore */ }
+    try { sessionStorage.setItem(READING_POSITION_KEY, serialized); } catch (e) { /* ignore */ }
+    try {
+      if (typeof window.TwkanBridge.saveReaderState === "function") {
+        window.TwkanBridge.saveReaderState("position", serialized);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function loadReadingPosition() {
+    var stored = null;
+    try { stored = JSON.parse(sessionStorage.getItem(READING_POSITION_KEY) || "null"); } catch (e) { /* ignore */ }
+    if (!stored) {
+      try { stored = JSON.parse(localStorage.getItem(READING_POSITION_KEY) || "null"); } catch (e) { /* ignore */ }
+    }
+    if (!stored) {
+      try {
+        if (typeof window.TwkanBridge.loadReaderState === "function") {
+          var nativeRaw = window.TwkanBridge.loadReaderState("position");
+          if (nativeRaw) stored = JSON.parse(nativeRaw);
+        }
+      } catch (e) { /* ignore */ }
+    }
+    if (!stored || !isFinite(Number(stored.scrollY))) return null;
+    if (Date.now() - Number(stored.updatedAt || 0) > 24 * 60 * 60 * 1000) return null;
+    return stored;
+  }
+
+  function cancelReadingPositionRestore() {
+    if (readingPositionRestoreTimer !== null) {
+      window.clearTimeout(readingPositionRestoreTimer);
+      readingPositionRestoreTimer = null;
+    }
+  }
+
+
+  function restoreReadingPosition() {
+    var stored = loadReadingPosition();
+    if (!stored) return;
+    var currentPageUrl = window.location.href.split("#")[0];
+    if (stored.pageUrl && stored.pageUrl !== currentPageUrl) return;
+    if (stored.chapterUrl && stored.chapterUrl !== initialChapterUrl) return;
+    cancelReadingPositionRestore();
+    var attempts = 0;
+    function restore() {
+      attempts++;
+      if (stored.chapterUrl && currentReadingUrl && stored.chapterUrl !== currentReadingUrl) {
+        if (attempts < 12) readingPositionRestoreTimer = window.setTimeout(restore, 250);
+        return;
+      }
+      var targetY = Math.max(0, Number(stored.scrollY));
+      var restoredChapter = document.querySelector("[data-twkan-reading-chapter='true']");
+      if (restoredChapter && isFinite(Number(stored.chapterOffset))) {
+        var rect = restoredChapter.getBoundingClientRect();
+        var top = rect.top + (window.scrollY || window.pageYOffset || 0);
+        var maxOffset = Math.max(0, rect.height - Math.min(window.innerHeight * 0.35, rect.height));
+        var safeOffset = Math.min(Math.max(0, Number(stored.chapterOffset)), maxOffset);
+        targetY = Math.max(0, top + safeOffset);
+      }
+      window.scrollTo(0, targetY);
+      if (attempts < 3) {
+        readingPositionRestoreTimer = window.setTimeout(restore, 300);
+      } else {
+        readingPositionRestoreTimer = null;
+      }
+    }
+    readingPositionRestoreTimer = window.setTimeout(restore, 120);
+    window.addEventListener("touchstart", cancelReadingPositionRestore, { once: true, passive: true });
+    window.addEventListener("wheel", cancelReadingPositionRestore, { once: true, passive: true });
   }
 
 
@@ -874,11 +1003,42 @@
     return /Cloudflare|HTTP (403|429)/i.test(error && error.message || "");
   }
 
+  function setCloudflareBlocked(url) {
+    cloudflareBlockedUrl = normalizeUrl(url);
+    cloudflareBlockedAt = Date.now();
+    try {
+      localStorage.setItem(CLOUDFLARE_BLOCKED_KEY, JSON.stringify({
+        url: cloudflareBlockedUrl,
+        blockedAt: cloudflareBlockedAt
+      }));
+    } catch (e) { /* ignore */ }
+  }
+
+  function loadCloudflareBlocked() {
+    try {
+      var stored = JSON.parse(localStorage.getItem(CLOUDFLARE_BLOCKED_KEY) || "null");
+      if (stored && Date.now() - Number(stored.blockedAt || 0) < 10 * 60 * 1000) {
+        cloudflareBlockedUrl = normalizeUrl(stored.url);
+        cloudflareBlockedAt = Number(stored.blockedAt);
+      } else {
+        localStorage.removeItem(CLOUDFLARE_BLOCKED_KEY);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function clearCloudflareBlocked() {
+    cloudflareBlockedUrl = null;
+    cloudflareBlockedAt = 0;
+    try { localStorage.removeItem(CLOUDFLARE_BLOCKED_KEY); } catch (e) { /* ignore */ }
+  }
+
+
   function openChapterInVisibleReader(url) {
     if (!url) return;
-    cloudflareBlockedUrl = url;
-    cloudflareBlockedAt = Date.now();
-    setLoadingState("正在打开下一章，请在当前页面完成网站验证…", true);
+    setCloudflareBlocked(url);
+    saveReadingSettings();
+    saveReadingPosition();
+    setLoadingState("正在打开下一章，请在当前页面完成网站验证…", false);
     window.location.href = url;
   }
 
@@ -900,8 +1060,7 @@
       })
       .then(function (html) {
         if (isCloudflareChallenge(html)) {
-          cloudflareBlockedUrl = url;
-          cloudflareBlockedAt = Date.now();
+          setCloudflareBlocked(url);
           throw new Error("Cloudflare challenge");
         }
         var doc = new DOMParser().parseFromString(html, "text/html");
@@ -954,9 +1113,8 @@
       document.dispatchEvent(new CustomEvent("chapterchange", { detail: detail }));
     } catch (e) { /* old WebView fallback */ }
 
-    // Ask Android to open this chapter once in a hidden, cookie-sharing WebView.
-    // That executes the site's own read-history script without leaving the
-    // infinite reader. It is called only when the chapter is actually read.
+    // Keep the compatibility bridge call for older app builds. Current Android
+    // versions intentionally treat it as a no-op to avoid hidden network loads.
     try {
       if (typeof window.TwkanBridge.syncReadingRecord === "function") {
         window.TwkanBridge.syncReadingRecord(url);
@@ -986,6 +1144,7 @@
 
     if (title) document.title = title;
     document.documentElement.setAttribute("data-current-chapter-url", url);
+    saveReadingPosition();
 
     // The initial page records itself during normal navigation. Returning to it
     // later should still update the record, so notify on every chapter change.
@@ -994,6 +1153,7 @@
 
   function updateVisibleReadingChapter() {
     if (!infiniteInitialized) return;
+    saveReadingPositionSoon();
     var chapters = document.querySelectorAll("[data-twkan-reading-chapter='true']");
     if (!chapters.length) return;
     var readingLine = Math.max(120, window.innerHeight * 0.35);
@@ -1011,6 +1171,21 @@
     activateReadingChapter(active, false);
   }
 
+  function saveReadingPositionSoon() {
+    if (saveReadingPositionSoon.timer) return;
+    saveReadingPositionSoon.timer = window.setTimeout(function () {
+      saveReadingPositionSoon.timer = null;
+      saveReadingPosition();
+    }, 500);
+  }
+
+  function persistReaderStateNow() {
+    if (!infiniteInitialized) return;
+    saveReadingSettings();
+    saveReadingPosition();
+  }
+
+
   function scheduleReadingTracker() {
     if (readingTrackerTimer !== null) return;
     readingTrackerTimer = window.requestAnimationFrame(function () {
@@ -1020,7 +1195,7 @@
   }
 
 
-  function appendNextChapter() {
+  function appendNextChapter(allowVisibleNavigation) {
     if (appendingChapter || noMoreChapters || !nextChapterUrl || !infiniteHost) {
       return Promise.resolve(null);
     }
@@ -1031,7 +1206,11 @@
       return Promise.resolve(null);
     }
     if (cloudflareBlockedUrl === requestedUrl && Date.now() - cloudflareBlockedAt < 10 * 60 * 1000) {
-      openChapterInVisibleReader(requestedUrl);
+      if (allowVisibleNavigation === true) {
+        openChapterInVisibleReader(requestedUrl);
+      } else {
+        setLoadingState("网站要求验证，点这里打开下一章", true);
+      }
       return Promise.resolve(null);
     }
 
@@ -1070,6 +1249,7 @@
         infiniteHost.insertBefore(section, loadingIndicator);
 
         appendedUrls[chapter.url] = true;
+        if (cloudflareBlockedUrl === chapter.url) clearCloudflareBlocked();
         nextChapterUrl = chapter.nextUrl;
         appendingChapter = false;
 
@@ -1085,7 +1265,8 @@
       .catch(function (error) {
         appendingChapter = false;
         if (isCloudflareError(error)) {
-          openChapterInVisibleReader(requestedUrl);
+          setCloudflareBlocked(requestedUrl);
+          setLoadingState("网站要求验证，点这里打开下一章", true);
         } else {
           setLoadingState("下一章加载失败，点这里重试", true);
         }
@@ -1279,6 +1460,8 @@
     currentReadingUrl = initialChapterUrl;
     nextChapterUrl = nextInfo ? normalizeUrl(nextInfo.url) : null;
     appendedUrls[initialChapterUrl] = true;
+    loadCloudflareBlocked();
+    if (cloudflareBlockedUrl && cloudflareBlockedUrl !== nextChapterUrl) clearCloudflareBlocked();
 
     // Treat the original chapter as the first tracked section. Its URL remains
     // the real network URL even after history.replaceState changes location.
@@ -1302,7 +1485,12 @@
     loadingIndicator.className = "twkan-infinite-status";
     loadingIndicator.style.display = "none";
     loadingIndicator.addEventListener("click", function () {
-      if (loadingIndicator.classList.contains("twkan-infinite-error")) appendNextChapter();
+      if (!loadingIndicator.classList.contains("twkan-infinite-error")) return;
+      if (cloudflareBlockedUrl) {
+        openChapterInVisibleReader(cloudflareBlockedUrl);
+        return;
+      }
+      appendNextChapter(true);
     });
     infiniteHost.appendChild(loadingIndicator);
 
@@ -1318,13 +1506,17 @@
     }
     hideOriginalChapterNavigation(nextInfo && nextInfo.element);
     ensureReadingSettingsPanel();
+    restoreReadingPosition();
+    if (cloudflareBlockedUrl === nextChapterUrl) {
+      setLoadingState("网站要求验证，点这里打开下一章", true);
+    }
 
     // Load when the reader is roughly 1.5 screens from the bottom.
     if (typeof IntersectionObserver !== "undefined") {
       var observer = new IntersectionObserver(function (entries) {
         for (var i = 0; i < entries.length; i++) {
           if (entries[i].isIntersecting) {
-            appendNextChapter();
+            appendNextChapter(false);
             return;
           }
         }
@@ -1333,7 +1525,7 @@
     } else {
       window.addEventListener("scroll", function () {
         if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 1600) {
-          appendNextChapter();
+          appendNextChapter(false);
         }
       }, { passive: true });
     }
@@ -1346,7 +1538,7 @@
       var clickedUrl = normalizeUrl(anchor.getAttribute("href"));
       if (clickedUrl === normalizeUrl(nextChapterUrl)) {
         event.preventDefault();
-        appendNextChapter().then(function (section) {
+        appendNextChapter(true).then(function (section) {
           if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
         });
       }
@@ -1359,14 +1551,21 @@
     window.addEventListener("scroll", scheduleReadingTracker, { passive: true });
     window.addEventListener("resize", scheduleReadingTracker, { passive: true });
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) scheduleReadingTracker();
+      if (document.hidden) {
+        persistReaderStateNow();
+      } else {
+        scheduleReadingTracker();
+      }
     });
+    window.addEventListener("pagehide", persistReaderStateNow);
+    window.addEventListener("beforeunload", persistReaderStateNow);
     scheduleReadingTracker();
   }
 
   // ─── Public run entry ─────────────────────────────────────────────────────
   window[runKey] = function () {
     pageReadySent = false;
+    loadReadingSettings();
     schedule(document.body || document.documentElement, true /* isFirstPass */);
     initAdBlocker();
     setTimeout(initInfiniteReader, 500);
