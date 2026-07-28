@@ -308,6 +308,18 @@
   var readingTrackerTimer = null;
   var cloudflareBlockedUrl = null;
   var cloudflareBlockedAt = 0;
+  // Tracks cleanup callbacks for in-flight hidden-iframe Cloudflare probes,
+  // so navigating away from the reader (library/history page, or the whole
+  // page unloading) can force-stop any pending polling timers instead of
+  // leaking them.
+  var activeIframeCleanups = [];
+
+  function cancelActiveIframeProbes() {
+    while (activeIframeCleanups.length) {
+      var cleanupFn = activeIframeCleanups.pop();
+      try { cleanupFn(); } catch (e) { /* ignore */ }
+    }
+  }
 
   var readingSettings = {
     fontSize: 20,
@@ -572,6 +584,8 @@
 
   function stopInfiniteReaderOnLibraryPage() {
     if (!infiniteInitialized || !isLibraryOrHistoryPage(document)) return false;
+
+    cancelActiveIframeProbes();
 
     var managed = document.querySelectorAll("[data-twkan-infinite-managed='true']");
     for (var i = managed.length - 1; i >= 0; i--) managed[i].remove();
@@ -1035,11 +1049,125 @@
 
   function openChapterInVisibleReader(url) {
     if (!url) return;
+    cancelActiveIframeProbes();
     setCloudflareBlocked(url);
     saveReadingSettings();
     saveReadingPosition();
     setLoadingState("正在打开下一章，请在当前页面完成网站验证…", false);
     window.location.href = url;
+  }
+
+  /**
+   * fetch() only downloads bytes; it never executes the returned <script>.
+   * Cloudflare's non-interactive "Just a moment..." JS challenge only clears
+   * once its script actually *runs* in a real page context and sets a pass
+   * cookie. That is why a background fetch() to the next chapter fails almost
+   * every time a challenge is active, even though a normal page load would
+   * pass silently within a few seconds. To avoid surfacing that failure to
+   * the user, load the same URL once in a hidden same-origin <iframe> (a real
+   * execution context) and poll its document until the challenge markup is
+   * gone. This resolves automatically for non-interactive challenges without
+   * any visible UI; only challenges that truly require human interaction
+   * (slider/captcha) will still time out and fall through to the existing
+   * "点击打开下一章" visible-WebView flow.
+   */
+  function fetchChapterViaHiddenIframe(url) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var pollTimer = null;
+      var timeoutTimer = null;
+      var iframe = document.createElement("iframe");
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.setAttribute("tabindex", "-1");
+      // Some Cloudflare challenge pages try to bust out of frames
+      // ("if (top.location !== self.location) top.location = ...") to force
+      // full-page display. Sandboxing without allow-top-navigation blocks
+      // that redirect attempt while still letting the challenge script run
+      // and access its own same-origin document.
+      iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms");
+      iframe.style.position = "fixed";
+      iframe.style.top = "-9999px";
+      iframe.style.left = "-9999px";
+      iframe.style.width = "1px";
+      iframe.style.height = "1px";
+      iframe.style.opacity = "0";
+      iframe.style.border = "0";
+      iframe.style.pointerEvents = "none";
+
+      function cleanup() {
+        if (pollTimer !== null) window.clearInterval(pollTimer);
+        if (timeoutTimer !== null) window.clearTimeout(timeoutTimer);
+        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+        var idx = activeIframeCleanups.indexOf(cleanupEntry);
+        if (idx !== -1) activeIframeCleanups.splice(idx, 1);
+      }
+
+      // Registered so a page-level navigation-away event (leaving the
+      // reader, or the whole page unloading) can force this probe to stop
+      // immediately instead of polling a detached/stale iframe forever.
+      function cleanupEntry() {
+        fail("Reader navigated away");
+      }
+      activeIframeCleanups.push(cleanupEntry);
+
+      function finish(html) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(html);
+      }
+
+      function fail(reason) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(reason || "Cloudflare challenge"));
+      }
+
+      var attempts = 0;
+      var maxAttempts = 48; // ~250ms * 48 = 12s, generous for a JS challenge
+
+      pollTimer = window.setInterval(function () {
+        attempts++;
+        var doc;
+        try {
+          doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+        } catch (e) {
+          fail("Cross-origin iframe");
+          return;
+        }
+        if (!doc || !doc.documentElement || !doc.body || doc.readyState !== "complete") {
+          if (attempts >= maxAttempts) fail("Cloudflare challenge timeout");
+          return;
+        }
+        var html = doc.documentElement.outerHTML || "";
+        var hasText = doc.body.textContent && doc.body.textContent.trim().length > 40;
+        // Guard against a transient redirect/meta-refresh stub page (e.g.
+        // "Redirecting...") being mistaken for the final loaded chapter: the
+        // iframe's own location should have settled on the requested URL.
+        var locationSettled = true;
+        try {
+          locationSettled = !iframe.contentWindow || !iframe.contentWindow.location ||
+            normalizeUrl(iframe.contentWindow.location.href) === url;
+        } catch (e) { /* cross-origin during redirect; keep polling */ }
+        if (hasText && locationSettled && !isCloudflareChallenge(html)) {
+          finish(html);
+        } else if (attempts >= maxAttempts) {
+          fail("Cloudflare challenge timeout");
+        }
+      }, 250);
+
+      timeoutTimer = window.setTimeout(function () {
+        fail("Cloudflare challenge timeout");
+      }, 13000);
+
+      iframe.addEventListener("error", function () {
+        fail("Iframe load error");
+      });
+
+      iframe.src = url;
+      document.body.appendChild(iframe);
+    });
   }
 
   /** Fetch and parse once; keep the actual chapter in memory, not only HTTP cache. */
@@ -1055,14 +1183,29 @@
       redirect: "follow"
     })
       .then(function (response) {
-        if (!response.ok) throw new Error("HTTP " + response.status);
+        if (!response.ok) {
+          // Cloudflare sometimes rejects the raw fetch outright (403/429)
+          // instead of returning challenge HTML. Try the hidden-iframe
+          // fallback in that case too, before giving up.
+          if (response.status === 403 || response.status === 429) {
+            return fetchChapterViaHiddenIframe(url).catch(function () {
+              setCloudflareBlocked(url);
+              throw new Error("HTTP " + response.status);
+            });
+          }
+          throw new Error("HTTP " + response.status);
+        }
         return response.text();
       })
       .then(function (html) {
-        if (isCloudflareChallenge(html)) {
+        if (!isCloudflareChallenge(html)) return html;
+        // Try the silent hidden-iframe fallback before giving up.
+        return fetchChapterViaHiddenIframe(url).catch(function () {
           setCloudflareBlocked(url);
           throw new Error("Cloudflare challenge");
-        }
+        });
+      })
+      .then(function (html) {
         var doc = new DOMParser().parseFromString(html, "text/html");
         doc.__twkanSourceUrl = url;
         var chapter = extractChapter(doc, url);
@@ -1181,6 +1324,7 @@
 
   function persistReaderStateNow() {
     if (!infiniteInitialized) return;
+    cancelActiveIframeProbes();
     saveReadingSettings();
     saveReadingPosition();
   }
