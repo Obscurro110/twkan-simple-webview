@@ -867,7 +867,19 @@
   }
 
   function isCloudflareChallenge(html) {
-    return /cf-chl-|challenge-platform|Just a moment|验证您是真人|驗證您是真人/i.test(html || "");
+    return /cf-chl-|challenge-platform|Just a moment|验证您是真人|驗證您是真人|Checking your browser|Checking if the site connection is secure|Enable JavaScript and cookies to continue/i.test(html || "");
+  }
+
+  function isCloudflareError(error) {
+    return /Cloudflare|HTTP (403|429)/i.test(error && error.message || "");
+  }
+
+  function openChapterInVisibleReader(url) {
+    if (!url) return;
+    cloudflareBlockedUrl = url;
+    cloudflareBlockedAt = Date.now();
+    setLoadingState("正在打开下一章，请在当前页面完成网站验证…", true);
+    window.location.href = url;
   }
 
   /** Fetch and parse once; keep the actual chapter in memory, not only HTTP cache. */
@@ -1019,8 +1031,7 @@
       return Promise.resolve(null);
     }
     if (cloudflareBlockedUrl === requestedUrl && Date.now() - cloudflareBlockedAt < 10 * 60 * 1000) {
-      setLoadingState("请在当前页面完成网站验证，正在打开下一章…", true);
-      window.location.href = requestedUrl;
+      openChapterInVisibleReader(requestedUrl);
       return Promise.resolve(null);
     }
 
@@ -1073,9 +1084,8 @@
       })
       .catch(function (error) {
         appendingChapter = false;
-        if (cloudflareBlockedUrl === requestedUrl || /Cloudflare/i.test(error && error.message || "")) {
-          cloudflareBlockedUrl = requestedUrl;
-          setLoadingState("网站正在验证，请先在当前页面完成验证后，再点击这里重试", true);
+        if (isCloudflareError(error)) {
+          openChapterInVisibleReader(requestedUrl);
         } else {
           setLoadingState("下一章加载失败，点这里重试", true);
         }
