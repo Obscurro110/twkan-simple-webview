@@ -138,6 +138,7 @@
   var READING_SETTINGS_KEY = "twkan:readingSettings";
   var READING_POSITION_KEY = "twkan:readingPosition";
   var CLOUDFLARE_BLOCKED_KEY = "twkan:cloudflareBlocked";
+  var READING_HISTORY_URL = "https://twkan.com/history";
 
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -446,6 +447,20 @@
     readingSettings = { fontSize: 20, lineHeight: 1.9, letterSpacing: 0, background: "site" };
     saveReadingSettings();
     applyReadingSettings();
+  }
+
+  /**
+   * Navigate to the website's own reading-history page. Reading progress is
+   * tracked by the site itself via cookies/local storage, not by this reader,
+   * so no extra sync call is required here — just persist local reader state
+   * (settings + current chapter position) before leaving so it can be
+   * restored if the user comes back to this chapter later.
+   */
+  function goToReadingHistory() {
+    cancelActiveIframeProbes();
+    saveReadingSettings();
+    saveReadingPosition();
+    window.location.href = READING_HISTORY_URL;
   }
 
 
@@ -1554,11 +1569,39 @@
     });
     panel.appendChild(reset);
 
-    toggle.addEventListener("click", function () {
+    var historyLink = document.createElement("button");
+    historyLink.type = "button";
+    historyLink.textContent = "阅读记录";
+    historyLink.title = "跳转到阅读记录";
+    historyLink.setAttribute("aria-label", "跳转到阅读记录");
+    historyLink.className = "twkan-settings-history";
+    historyLink.addEventListener("click", function () {
+      goToReadingHistory();
+    });
+    panel.appendChild(historyLink);
+
+    toggle.addEventListener("click", function (event) {
+      event.stopPropagation();
       panel.style.display = panel.style.display === "none" ? "block" : "none";
       applyReadingSettings();
     });
     close.addEventListener("click", function () { panel.style.display = "none"; });
+    // Tapping anywhere else on the page (typically the chapter content, to
+    // read undisturbed) collapses the open settings panel back to the "Aa"
+    // toggle icon. Taps on the toggle itself or inside the panel (sliders,
+    // buttons, select) must not trigger this — checked directly here rather
+    // than relying on stopPropagation, since this listener runs in the
+    // capture phase (before the panel's own bubble-phase handlers).
+    document.addEventListener("click", function (event) {
+      if (panel.style.display === "none") return;
+      var target = event.target;
+      if (target && target.closest &&
+          (target.closest("[data-twkan-reader-settings-toggle='true']") ||
+           target.closest("[data-twkan-reader-settings='true']"))) {
+        return;
+      }
+      panel.style.display = "none";
+    }, true);
 
     document.body.appendChild(toggle);
     document.body.appendChild(panel);
@@ -1784,6 +1827,7 @@
     '.twkan-settings-row select { grid-column: 2 !important; min-width: 0 !important; width: 100% !important; padding: 5px !important; }',
     '.twkan-settings-value { text-align: right !important; color: #666 !important; font-variant-numeric: tabular-nums !important; }',
     '.twkan-settings-reset { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #bbb !important; border-radius: 6px !important; background: #f5f5f5 !important; color: #222 !important; }',
+    '.twkan-settings-history { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #7a9dd6 !important; border-radius: 6px !important; background: #eef3fc !important; color: #22468c !important; }',
 
     '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; }',
     '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 28px auto 18px !important; background: rgba(127,127,127,.32) !important; }',
