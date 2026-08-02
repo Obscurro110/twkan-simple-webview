@@ -138,6 +138,7 @@
   var READING_SETTINGS_KEY = "twkan:readingSettings";
   var READING_POSITION_KEY = "twkan:readingPosition";
   var CLOUDFLARE_BLOCKED_KEY = "twkan:cloudflareBlocked";
+  var CLOUDFLARE_CHALLENGE_KEY = "twkan:cloudflareChallengeSeen";
   var READING_HISTORY_URL = "https://twkan.com/history";
 
 
@@ -292,23 +293,30 @@
     }, 60);
   }
 
-  // ─── Infinite Chapter Reader + 3-chapter memory prefetch ──────────────────
+  // ─── Infinite Chapter Reader + conservative memory prefetch ────────────────
   var PREFETCH_AHEAD = 0;
+  var AUTO_APPEND_ROOT_MARGIN_PX = 900;
+  var AUTO_APPEND_MIN_INTERVAL_MS = 3000;
+  var CLOUDFLARE_IFRAME_FIRST_WINDOW_MS = 15 * 60 * 1000;
   var chapterCache = Object.create(null);
   var chapterRequests = Object.create(null);
   var appendedUrls = Object.create(null);
   var infiniteInitialized = false;
   var infiniteHost = null;
+  var infiniteSentinel = null;
   var loadingIndicator = null;
   var nextChapterUrl = null;
   var appendingChapter = false;
   var noMoreChapters = false;
+  var nextAutomaticAppendAt = 0;
+  var automaticAppendTimer = null;
   var initialChapterUrl = null;
   var initialChapterTitle = null;
   var currentReadingUrl = null;
   var readingTrackerTimer = null;
   var cloudflareBlockedUrl = null;
   var cloudflareBlockedAt = 0;
+  var cloudflareChallengeSeenAt = 0;
   // Tracks cleanup callbacks for in-flight hidden-iframe Cloudflare probes,
   // so navigating away from the reader (library/history page, or the whole
   // page unloading) can force-stop any pending polling timers instead of
@@ -319,6 +327,13 @@
     while (activeIframeCleanups.length) {
       var cleanupFn = activeIframeCleanups.pop();
       try { cleanupFn(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function cancelScheduledAutomaticAppend() {
+    if (automaticAppendTimer !== null) {
+      window.clearTimeout(automaticAppendTimer);
+      automaticAppendTimer = null;
     }
   }
 
@@ -458,6 +473,7 @@
    */
   function goToReadingHistory() {
     cancelActiveIframeProbes();
+    cancelScheduledAutomaticAppend();
     saveReadingSettings();
     saveReadingPosition();
     window.location.href = READING_HISTORY_URL;
@@ -614,10 +630,13 @@
 
     infiniteInitialized = false;
     infiniteHost = null;
+    infiniteSentinel = null;
     loadingIndicator = null;
     nextChapterUrl = null;
     appendingChapter = false;
     noMoreChapters = false;
+    nextAutomaticAppendAt = 0;
+    cancelScheduledAutomaticAppend();
     currentReadingUrl = null;
     if (readingTrackerTimer !== null) {
       window.cancelAnimationFrame(readingTrackerTimer);
@@ -1028,11 +1047,33 @@
     return /cf-chl-|challenge-platform|Just a moment|验证您是真人|驗證您是真人|Checking your browser|Checking if the site connection is secure|Enable JavaScript and cookies to continue/i.test(html || "");
   }
 
+  function noteCloudflareChallenge() {
+    cloudflareChallengeSeenAt = Date.now();
+    try { localStorage.setItem(CLOUDFLARE_CHALLENGE_KEY, String(cloudflareChallengeSeenAt)); } catch (e) { /* ignore */ }
+  }
+
+  function loadCloudflareChallengeState() {
+    try {
+      var seenAt = Number(localStorage.getItem(CLOUDFLARE_CHALLENGE_KEY) || 0);
+      if (seenAt > 0 && Date.now() - seenAt < CLOUDFLARE_IFRAME_FIRST_WINDOW_MS) {
+        cloudflareChallengeSeenAt = seenAt;
+      } else {
+        localStorage.removeItem(CLOUDFLARE_CHALLENGE_KEY);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function shouldUseCloudflareIframeFirst() {
+    return cloudflareChallengeSeenAt > 0 &&
+      Date.now() - cloudflareChallengeSeenAt < CLOUDFLARE_IFRAME_FIRST_WINDOW_MS;
+  }
+
   function isCloudflareError(error) {
     return /Cloudflare|HTTP (403|429)/i.test(error && error.message || "");
   }
 
   function setCloudflareBlocked(url) {
+    noteCloudflareChallenge();
     cloudflareBlockedUrl = normalizeUrl(url);
     cloudflareBlockedAt = Date.now();
     try {
@@ -1065,6 +1106,7 @@
   function openChapterInVisibleReader(url) {
     if (!url) return;
     cancelActiveIframeProbes();
+    cancelScheduledAutomaticAppend();
     setCloudflareBlocked(url);
     saveReadingSettings();
     saveReadingPosition();
@@ -1192,34 +1234,51 @@
     if (chapterCache[url]) return Promise.resolve(chapterCache[url]);
     if (chapterRequests[url]) return chapterRequests[url];
 
-    chapterRequests[url] = fetch(url, {
-      credentials: "include",
-      cache: "default",
-      redirect: "follow"
-    })
-      .then(function (response) {
-        if (!response.ok) {
-          // Cloudflare sometimes rejects the raw fetch outright (403/429)
-          // instead of returning challenge HTML. Try the hidden-iframe
-          // fallback in that case too, before giving up.
-          if (response.status === 403 || response.status === 429) {
-            return fetchChapterViaHiddenIframe(url).catch(function () {
-              setCloudflareBlocked(url);
-              throw new Error("HTTP " + response.status);
-            });
+    var htmlPromise;
+    if (shouldUseCloudflareIframeFirst()) {
+      // A recent challenge means a raw fetch is likely to receive another
+      // non-executable challenge page. Use exactly one real-page request
+      // instead of fetch() followed by a second request through an iframe.
+      htmlPromise = fetchChapterViaHiddenIframe(url).catch(function () {
+        setCloudflareBlocked(url);
+        throw new Error("Cloudflare challenge");
+      });
+    } else {
+      htmlPromise = fetch(url, {
+        credentials: "include",
+        cache: "default",
+        redirect: "follow"
+      })
+        .then(function (response) {
+          if (!response.ok) {
+            // Cloudflare sometimes rejects the raw fetch outright (403/429)
+            // instead of returning challenge HTML. Record that signal before
+            // retrying once in a real page context.
+            if (response.status === 403 || response.status === 429) {
+              noteCloudflareChallenge();
+              return fetchChapterViaHiddenIframe(url).catch(function () {
+                setCloudflareBlocked(url);
+                throw new Error("HTTP " + response.status);
+              });
+            }
+            throw new Error("HTTP " + response.status);
           }
-          throw new Error("HTTP " + response.status);
-        }
-        return response.text();
-      })
-      .then(function (html) {
-        if (!isCloudflareChallenge(html)) return html;
-        // Try the silent hidden-iframe fallback before giving up.
-        return fetchChapterViaHiddenIframe(url).catch(function () {
-          setCloudflareBlocked(url);
-          throw new Error("Cloudflare challenge");
+          return response.text();
+        })
+        .then(function (html) {
+          if (!isCloudflareChallenge(html)) return html;
+          noteCloudflareChallenge();
+          // The raw fetch cannot execute a JS challenge. Retry once in the
+          // hidden real-page context, then stop on failure rather than making
+          // additional background requests.
+          return fetchChapterViaHiddenIframe(url).catch(function () {
+            setCloudflareBlocked(url);
+            throw new Error("Cloudflare challenge");
+          });
         });
-      })
+    }
+
+    chapterRequests[url] = htmlPromise
       .then(function (html) {
         var doc = new DOMParser().parseFromString(html, "text/html");
         doc.__twkanSourceUrl = url;
@@ -1340,6 +1399,7 @@
   function persistReaderStateNow() {
     if (!infiniteInitialized) return;
     cancelActiveIframeProbes();
+    cancelScheduledAutomaticAppend();
     saveReadingSettings();
     saveReadingPosition();
   }
@@ -1354,8 +1414,22 @@
   }
 
 
+  function queueAutomaticAppend() {
+    if (automaticAppendTimer !== null || appendingChapter || noMoreChapters || !nextChapterUrl) return;
+    var delay = Math.max(0, nextAutomaticAppendAt - Date.now());
+    automaticAppendTimer = window.setTimeout(function () {
+      automaticAppendTimer = null;
+      appendNextChapter(false);
+    }, delay);
+  }
+
   function appendNextChapter(allowVisibleNavigation) {
+    if (allowVisibleNavigation === true) cancelScheduledAutomaticAppend();
     if (appendingChapter || noMoreChapters || !nextChapterUrl || !infiniteHost) {
+      return Promise.resolve(null);
+    }
+    if (allowVisibleNavigation !== true && Date.now() < nextAutomaticAppendAt) {
+      queueAutomaticAppend();
       return Promise.resolve(null);
     }
     var requestedUrl = normalizeUrl(nextChapterUrl);
@@ -1374,6 +1448,9 @@
     }
 
     appendingChapter = true;
+    if (allowVisibleNavigation !== true) {
+      nextAutomaticAppendAt = Date.now() + AUTO_APPEND_MIN_INTERVAL_MS;
+    }
     setLoadingState("正在加载下一章…", false);
 
     return fetchChapter(requestedUrl)
@@ -1418,6 +1495,10 @@
         } else {
           setLoadingState("", false);
           prefetchChain(nextChapterUrl, PREFETCH_AHEAD);
+          if (infiniteSentinel &&
+              infiniteSentinel.getBoundingClientRect().top <= window.innerHeight + AUTO_APPEND_ROOT_MARGIN_PX) {
+            queueAutomaticAppend();
+          }
         }
         return section;
       })
@@ -1647,6 +1728,7 @@
     currentReadingUrl = initialChapterUrl;
     nextChapterUrl = nextInfo ? normalizeUrl(nextInfo.url) : null;
     appendedUrls[initialChapterUrl] = true;
+    loadCloudflareChallengeState();
     loadCloudflareBlocked();
     if (cloudflareBlockedUrl && cloudflareBlockedUrl !== nextChapterUrl) clearCloudflareBlocked();
 
@@ -1684,6 +1766,7 @@
     var sentinel = document.createElement("div");
     sentinel.className = "twkan-infinite-sentinel";
     sentinel.setAttribute("aria-hidden", "true");
+    infiniteSentinel = sentinel;
     infiniteHost.appendChild(sentinel);
 
     if (contentRoot === document.body || contentRoot === document.documentElement || !contentRoot.parentNode) {
@@ -1698,7 +1781,8 @@
       setLoadingState("网站要求验证，点这里打开下一章", true);
     }
 
-    // Load when the reader is roughly 1.5 screens from the bottom.
+    // Load when the reader is roughly one screen from the bottom. The append
+    // gate below adds a 3-second minimum interval for automatic requests.
     if (typeof IntersectionObserver !== "undefined") {
       var observer = new IntersectionObserver(function (entries) {
         for (var i = 0; i < entries.length; i++) {
@@ -1707,11 +1791,11 @@
             return;
           }
         }
-      }, { root: null, rootMargin: "1600px 0px", threshold: 0 });
+      }, { root: null, rootMargin: AUTO_APPEND_ROOT_MARGIN_PX + "px 0px", threshold: 0 });
       observer.observe(sentinel);
     } else {
       window.addEventListener("scroll", function () {
-        if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 1600) {
+        if (window.innerHeight + window.scrollY >= document.body.scrollHeight - AUTO_APPEND_ROOT_MARGIN_PX) {
           appendNextChapter(false);
         }
       }, { passive: true });
