@@ -453,6 +453,12 @@ public class MainActivity extends Activity {
             if (isTwkanHost(uri.getHost())) {
                 return false;
             }
+            // An outbound ad navigation here is virtually always an ad tapped by
+            // accident while scrolling to the end of a chapter. Swallow it
+            // instead of launching a browser.
+            if (isAdUrl(uri.toString())) {
+                return true;
+            }
             openExternal(uri);
             return true;
         }
@@ -461,7 +467,16 @@ public class MainActivity extends Activity {
             return false;
         }
 
-        openExternal(uri);
+        // mailto:/tel:/sms: are legitimate handoffs (feedback links, for example).
+        if ("mailto".equalsIgnoreCase(scheme)
+                || "tel".equalsIgnoreCase(scheme)
+                || "sms".equalsIgnoreCase(scheme)) {
+            openExternal(uri);
+            return true;
+        }
+
+        // intent:/market:/… links inside a novel page are ad or app-store
+        // redirects, never chapter navigation. Swallow them.
         return true;
     }
 

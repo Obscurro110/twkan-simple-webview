@@ -113,13 +113,128 @@
   }
 
 
-  function initAdBlocker() {
+  // ─── Accidental ad / outbound tap guard ───────────────────────────────────
+  var TWKAN_HOST_PATTERN = /(^|\.)twkan\.com$/i;
+  var externalLinkGuardInstalled = false;
+  var adBlockerTimer = null;
+
+  /**
+   * True for links that belong to the site itself or to harmless local UI
+   * behaviour. The site's own language switcher uses "javascript:zh_tran(...)"
+   * and several controls use bare "#" anchors, so those must keep working.
+   */
+  function isInternalHref(rawHref) {
+    if (!rawHref) return true;
+    var trimmed = String(rawHref).trim();
+    if (trimmed === "" || trimmed.charAt(0) === "#") return true;
+    if (/^(javascript|about):/i.test(trimmed)) return true;
+    if (/^(mailto|tel|sms):/i.test(trimmed)) return true;
+
+    var resolved = resolveUrl(trimmed, window.location.href);
+    if (!resolved) return true;
+    // Anything that is not plain http(s) at this point (intent:, market:, …)
+    // is an app-store/ad redirect rather than a chapter link.
+    if (!/^https?:/i.test(resolved)) return false;
+    try {
+      return TWKAN_HOST_PATTERN.test(new URL(resolved, window.location.href).hostname || "");
+    } catch (e) {
+      return true;
+    }
+  }
+
+  /**
+   * Ads near the bottom of a chapter are often stretched, text-free or
+   * absolutely positioned anchors, which makes them very easy to hit while
+   * scrolling to the end of a chapter. Remove those outright.
+   */
+  function removeAdOverlayAnchors() {
+    var anchors = document.querySelectorAll("a[href]");
+    for (var i = anchors.length - 1; i >= 0; i--) {
+      var anchor = anchors[i];
+      if (anchor.closest && anchor.closest("[data-twkan-reader-ui='true']")) continue;
+      if (isInternalHref(anchor.getAttribute("href"))) continue;
+
+      var rect = anchor.getBoundingClientRect();
+      var isLargeTarget = rect.width > 60 && rect.height > 40;
+      if (!isLargeTarget) continue;
+
+      var position = "";
+      try { position = window.getComputedStyle(anchor).position || ""; } catch (e) { /* ignore */ }
+      var isFloating = position === "fixed" || position === "absolute";
+      var hasNoLabel = (anchor.textContent || "").replace(/\s+/g, "").length === 0;
+      if (isFloating || hasNoLabel) {
+        anchor.style.setProperty("display", "none", "important");
+        anchor.remove();
+      }
+    }
+  }
+
+  /**
+   * Swallow taps that would leave twkan.com. This app is a single-site reader,
+   * so an outbound navigation here is virtually always an accidentally hit ad
+   * or footer link rather than something the reader asked for.
+   */
+  function installExternalLinkGuard() {
+    if (externalLinkGuardInstalled) return;
+    externalLinkGuardInstalled = true;
+    document.addEventListener("click", function (event) {
+      var target = event.target;
+      var anchor = target && target.closest ? target.closest("a[href]") : null;
+      if (!anchor) return;
+      // Reader UI is generated locally and must keep working.
+      if (anchor.closest("[data-twkan-reader-ui='true']")) return;
+      if (isInternalHref(anchor.getAttribute("href"))) return;
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
+  }
+
+  /**
+   * Hide the site footer / promo / friendly-link blocks that sit directly below
+   * the chapter while the infinite reader is active. Reaching the end of a
+   * chapter should not put outbound links under the reader's thumb.
+   */
+  function hideTrailingDistractions() {
+    if (!infiniteHost || !infiniteHost.parentNode) return;
+    var sibling = infiniteHost.nextElementSibling;
+    while (sibling) {
+      var next = sibling.nextElementSibling;
+      if (!sibling.getAttribute || sibling.getAttribute("data-twkan-reader-ui") !== "true") {
+        var text = (sibling.textContent || "").replace(/\s+/g, "");
+        var links = sibling.querySelectorAll ? sibling.querySelectorAll("a[href]") : [];
+        if (links.length > 0 && text.length <= 400) {
+          var hasExternalLink = false;
+          for (var i = 0; i < links.length; i++) {
+            if (!isInternalHref(links[i].getAttribute("href"))) {
+              hasExternalLink = true;
+              break;
+            }
+          }
+          if (hasExternalLink ||
+              /友情連結|友情链接|Cookies?\s*Policy|DMCA|Copyright|Powered\s*by/i.test(text)) {
+            sibling.style.setProperty("display", "none", "important");
+          }
+        }
+      }
+      sibling = next;
+    }
+  }
+
+
+  function runAdCleanupPass() {
     removeAds();
+    removeAdOverlayAnchors();
     removePromotionalText(document.body || document.documentElement);
-    setInterval(function () {
-      removeAds();
-      removePromotionalText(document.body || document.documentElement);
-    }, 2000);
+    hideTrailingDistractions();
+  }
+
+  function initAdBlocker() {
+    installExternalLinkGuard();
+    runAdCleanupPass();
+    // Re-injection (a new page load in the same WebView) must not stack another
+    // interval on top of the previous one.
+    if (adBlockerTimer !== null) window.clearInterval(adBlockerTimer);
+    adBlockerTimer = window.setInterval(runAdCleanupPass, 2000);
   }
 
   // ─── Constants ────────────────────────────────────────────────────────────
@@ -1775,6 +1890,7 @@
       contentRoot.parentNode.insertBefore(infiniteHost, contentRoot.nextSibling);
     }
     hideOriginalChapterNavigation(nextInfo && nextInfo.element);
+    hideTrailingDistractions();
     ensureReadingSettingsPanel();
     restoreReadingPosition();
     if (cloudflareBlockedUrl === nextChapterUrl) {
@@ -1923,8 +2039,8 @@
     '.twkan-appended-chapter-body { display: block !important; margin: 0 !important; padding: 0 !important; height: auto !important; min-height: 0 !important; }',
     '.twkan-appended-chapter-body > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }',
     '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
-    '.twkan-infinite-status { display: block; padding: 24px 12px !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
-    '.twkan-infinite-error { color: #b85c00 !important; cursor: pointer !important; }',
+    '.twkan-infinite-status { position: relative !important; z-index: 2147482000 !important; display: block; margin: 18px auto !important; padding: 20px 12px !important; max-width: 92% !important; border-radius: 10px !important; background: var(--twkan-reader-background) !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
+    '.twkan-infinite-error { border: 1px solid rgba(184,92,0,.45) !important; color: #b85c00 !important; font-weight: 700 !important; cursor: pointer !important; }',
     '.twkan-infinite-sentinel { display: block !important; width: 1px !important; height: 1px !important; }'
   ].join("\n");
   document.head.appendChild(style);
