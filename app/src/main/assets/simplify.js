@@ -412,7 +412,12 @@
   var PREFETCH_AHEAD = 0;
   var AUTO_APPEND_ROOT_MARGIN_PX = 900;
   var AUTO_APPEND_MIN_INTERVAL_MS = 3000;
-  var CLOUDFLARE_IFRAME_FIRST_WINDOW_MS = 15 * 60 * 1000;
+  // Fallback grace window, only used on older app builds whose bridge cannot
+  // report clearance-cookie presence.
+  var CLOUDFLARE_CHALLENGE_GRACE_MS = 15 * 60 * 1000;
+  // Clearance presence is stable for a while; cache it so a burst of chapter
+  // requests does not cross the JS/Java bridge repeatedly.
+  var CLEARANCE_PROBE_TTL_MS = 20 * 1000;
   var chapterCache = Object.create(null);
   var chapterRequests = Object.create(null);
   var appendedUrls = Object.create(null);
@@ -432,6 +437,10 @@
   var cloudflareBlockedUrl = null;
   var cloudflareBlockedAt = 0;
   var cloudflareChallengeSeenAt = 0;
+  // Cached answer from the bridge's clearance-cookie check, plus when it was
+  // taken. null/0 means "not probed yet in this window".
+  var clearanceCached = false;
+  var clearanceProbedAt = 0;
   // Tracks cleanup callbacks for in-flight hidden-iframe Cloudflare probes,
   // so navigating away from the reader (library/history page, or the whole
   // page unloading) can force-stop any pending polling timers instead of
@@ -1164,13 +1173,25 @@
 
   function noteCloudflareChallenge() {
     cloudflareChallengeSeenAt = Date.now();
+    // A challenge just came back, so any cached "clearance present" answer is
+    // stale: the cookie was either never valid or has just been rejected.
+    // Force a fresh probe rather than letting the TTL keep the old answer.
+    clearanceCached = false;
+    clearanceProbedAt = 0;
     try { localStorage.setItem(CLOUDFLARE_CHALLENGE_KEY, String(cloudflareChallengeSeenAt)); } catch (e) { /* ignore */ }
+  }
+
+  /** A successful load proves the current session is accepted again. */
+  function noteCloudflareCleared() {
+    cloudflareChallengeSeenAt = 0;
+    clearanceProbedAt = 0;
+    try { localStorage.removeItem(CLOUDFLARE_CHALLENGE_KEY); } catch (e) { /* ignore */ }
   }
 
   function loadCloudflareChallengeState() {
     try {
       var seenAt = Number(localStorage.getItem(CLOUDFLARE_CHALLENGE_KEY) || 0);
-      if (seenAt > 0 && Date.now() - seenAt < CLOUDFLARE_IFRAME_FIRST_WINDOW_MS) {
+      if (seenAt > 0 && Date.now() - seenAt < CLOUDFLARE_CHALLENGE_GRACE_MS) {
         cloudflareChallengeSeenAt = seenAt;
       } else {
         localStorage.removeItem(CLOUDFLARE_CHALLENGE_KEY);
@@ -1178,9 +1199,44 @@
     } catch (e) { /* ignore */ }
   }
 
+  /**
+   * Cloudflare issues a clearance cookie once a challenge has been passed. It is
+   * HttpOnly, so this page cannot read it directly; the Android bridge reports
+   * only whether it exists. Holding it is a far more accurate signal than
+   * guessing from "how long ago did a challenge fail", so a plain background
+   * request is only attempted while the session actually holds clearance.
+   *
+   * The result is cached briefly so a burst of chapter requests does not call
+   * across the bridge repeatedly.
+   */
+  function hasCloudflareClearance() {
+    var now = Date.now();
+    if (clearanceProbedAt > 0 && now - clearanceProbedAt < CLEARANCE_PROBE_TTL_MS) {
+      return clearanceCached;
+    }
+    var available = null;
+    try {
+      if (typeof window.TwkanBridge.hasCloudflareClearance === "function") {
+        available = window.TwkanBridge.hasCloudflareClearance() === true;
+      }
+    } catch (e) { /* bridge unavailable; fall back to the timing heuristic */ }
+    if (available === null) return null;
+    clearanceCached = available;
+    clearanceProbedAt = now;
+    return available;
+  }
+
   function shouldUseCloudflareIframeFirst() {
+    // Holding clearance means a plain background request is expected to be
+    // accepted, so use the cheap path even if a challenge happened earlier.
+    if (hasCloudflareClearance() === true) return false;
+
+    // Missing clearance on its own proves nothing: when the site is not
+    // challenging at all, no clearance cookie is ever issued and a plain fetch
+    // works fine. Only switch to the slower real-page channel when a challenge
+    // was actually observed recently.
     return cloudflareChallengeSeenAt > 0 &&
-      Date.now() - cloudflareChallengeSeenAt < CLOUDFLARE_IFRAME_FIRST_WINDOW_MS;
+      Date.now() - cloudflareChallengeSeenAt < CLOUDFLARE_CHALLENGE_GRACE_MS;
   }
 
   function isCloudflareError(error) {
@@ -1349,11 +1405,17 @@
     if (chapterCache[url]) return Promise.resolve(chapterCache[url]);
     if (chapterRequests[url]) return chapterRequests[url];
 
+    // Whether this chapter ultimately came through the hidden real-page channel.
+    // Used below to decide if the challenge marker may be dropped.
+    var usedRealPageChannel = false;
+
     var htmlPromise;
     if (shouldUseCloudflareIframeFirst()) {
-      // A recent challenge means a raw fetch is likely to receive another
-      // non-executable challenge page. Use exactly one real-page request
-      // instead of fetch() followed by a second request through an iframe.
+      usedRealPageChannel = true;
+      // Without a clearance cookie a plain fetch would almost certainly receive
+      // a challenge page it cannot execute. Skip it and spend the single
+      // request on a real page context, which can satisfy the challenge and
+      // have the clearance cookie issued.
       htmlPromise = fetchChapterViaHiddenIframe(url).catch(function () {
         setCloudflareBlocked(url);
         throw new Error("Cloudflare challenge");
@@ -1371,6 +1433,7 @@
             // retrying once in a real page context.
             if (response.status === 403 || response.status === 429) {
               noteCloudflareChallenge();
+              usedRealPageChannel = true;
               return fetchChapterViaHiddenIframe(url).catch(function () {
                 setCloudflareBlocked(url);
                 throw new Error("HTTP " + response.status);
@@ -1383,6 +1446,7 @@
         .then(function (html) {
           if (!isCloudflareChallenge(html)) return html;
           noteCloudflareChallenge();
+          usedRealPageChannel = true;
           // The raw fetch cannot execute a JS challenge. Retry once in the
           // hidden real-page context, then stop on failure rather than making
           // additional background requests.
@@ -1400,6 +1464,19 @@
         var chapter = extractChapter(doc, url);
         chapterCache[url] = chapter;
         delete chapterRequests[url];
+        // A real chapter came back. Drop the challenge marker so reading can
+        // return to the cheaper plain-fetch path — but only when that is
+        // actually safe:
+        //   * plain fetch succeeded  → the session is plainly accepted;
+        //   * real-page channel used → only if clearance was issued, otherwise
+        //     the next plain fetch would just hit the challenge again and turn
+        //     every chapter into two requests.
+        if (!usedRealPageChannel) {
+          noteCloudflareCleared();
+        } else {
+          clearanceProbedAt = 0;
+          if (hasCloudflareClearance() === true) noteCloudflareCleared();
+        }
         return chapter;
       })
       .catch(function (error) {

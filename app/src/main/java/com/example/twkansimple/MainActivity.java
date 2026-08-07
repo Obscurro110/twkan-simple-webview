@@ -47,6 +47,12 @@ public class MainActivity extends Activity {
     private static final String PREF_READING_SETTINGS = "reading_settings";
     private static final String PREF_READING_POSITION = "reading_position";
     private static final int SHOW_TIMEOUT_MS = 1500;
+    /**
+     * Cloudflare's pass cookie. It is HttpOnly, so page JavaScript cannot read
+     * it; only CookieManager can. The bridge exposes presence as a boolean and
+     * never returns the value itself.
+     */
+    private static final String CLEARANCE_COOKIE_NAME = "cf_clearance";
 
     /** Ad/tracker domains to block at the network layer. */
     private static final Set<String> AD_HOSTS = new HashSet<>(Arrays.asList(
@@ -620,6 +626,36 @@ public class MainActivity extends Activity {
                     .putString(preferenceKey, value)
                     .apply();
         }
+
+        /**
+         * Reports whether a Cloudflare clearance cookie is currently present for
+         * twkan.com. The cookie itself is HttpOnly, so page scripts cannot see
+         * it; only this boolean is exposed, never the token value. The reader
+         * uses it to decide whether a plain background request is likely to be
+         * accepted, instead of guessing from "how long ago did a challenge fail".
+         */
+        @JavascriptInterface
+        public boolean hasCloudflareClearance() {
+            try {
+                String cookies = CookieManager.getInstance().getCookie(HOME_URL);
+                if (cookies == null || cookies.isEmpty()) {
+                    return false;
+                }
+                for (String entry : cookies.split(";")) {
+                    String trimmed = entry.trim();
+                    if (!trimmed.startsWith(CLEARANCE_COOKIE_NAME + "=")) {
+                        continue;
+                    }
+                    // An empty or placeholder value means the cookie was
+                    // cleared/expired rather than freshly issued.
+                    return trimmed.length() > CLEARANCE_COOKIE_NAME.length() + 1;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Unable to read clearance cookie state", e);
+            }
+            return false;
+        }
+
 
         @JavascriptInterface
         public String toSimplified(String text) {
