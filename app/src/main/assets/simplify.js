@@ -1842,6 +1842,13 @@
     if (!contentRoot || !isLikelyChapterPage(document, contentRoot, nextInfo)) return;
 
     infiniteInitialized = true;
+    // Prevent the browser from auto-restoring scroll position when
+    // history.replaceState changes the URL as the reading line crosses chapter
+    // boundaries. Without this, Android WebView jumps back to the position it
+    // remembers for the newly-active URL, causing the sporadic scroll jumps.
+    try {
+      if (history.scrollRestoration) history.scrollRestoration = "manual";
+    } catch (e) { /* not supported; ignore */ }
     initialChapterUrl = normalizeUrl(sourceUrlFor(document));
     initialChapterTitle = getChapterTitle(document, contentRoot) || document.title;
     removePromotionalText(contentRoot);
