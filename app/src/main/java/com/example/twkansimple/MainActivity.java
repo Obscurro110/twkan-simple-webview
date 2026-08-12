@@ -46,6 +46,7 @@ public class MainActivity extends Activity {
     private static final String READER_PREFS_NAME = "twkan_reader_state";
     private static final String PREF_READING_SETTINGS = "reading_settings";
     private static final String PREF_READING_POSITION = "reading_position";
+    private static final String PREF_READING_HISTORY = "reading_history";
     private static final int SHOW_TIMEOUT_MS = 1500;
     private static final String CHALLENGE_PAGE_DETECTOR =
             "(function(){var html=document.documentElement?document.documentElement.outerHTML:'';"
@@ -468,18 +469,6 @@ public class MainActivity extends Activity {
         webView.setVisibility(View.VISIBLE);
     }
 
-    /**
-     * Reading history is already persisted locally by simplify.js and the
-     * chapter-change event is dispatched in the visible WebView. Do not open a
-     * second hidden WebView here: that extra navigation can trigger Cloudflare
-     * verification repeatedly and is not required for the local history page.
-     */
-    private void syncWebsiteReadingRecord(String url) {
-        // Intentionally no-op. Keep the bridge method for compatibility with
-        // older injected scripts, but never create a second network session.
-    }
-
-
     private boolean handleNavigation(Uri uri) {
         if (uri == null) {
             return false;
@@ -622,12 +611,6 @@ public class MainActivity extends Activity {
             mainHandler.post(() -> showWebView());
         }
 
-        /** Infinite reader calls this only after a chapter enters the viewport. */
-        @JavascriptInterface
-        public void syncReadingRecord(String url) {
-            mainHandler.post(() -> syncWebsiteReadingRecord(url));
-        }
-
         @JavascriptInterface
         public String loadReaderState(String key) {
             String preferenceKey;
@@ -635,6 +618,8 @@ public class MainActivity extends Activity {
                 preferenceKey = PREF_READING_SETTINGS;
             } else if ("position".equals(key)) {
                 preferenceKey = PREF_READING_POSITION;
+            } else if ("history".equals(key)) {
+                preferenceKey = PREF_READING_HISTORY;
             } else {
                 return "";
             }
@@ -650,6 +635,8 @@ public class MainActivity extends Activity {
                 preferenceKey = PREF_READING_SETTINGS;
             } else if ("position".equals(key)) {
                 preferenceKey = PREF_READING_POSITION;
+            } else if ("history".equals(key)) {
+                preferenceKey = PREF_READING_HISTORY;
             } else {
                 return;
             }

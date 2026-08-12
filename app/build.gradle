@@ -4,7 +4,7 @@ plugins {
 
 // Release versions are explicit and intentionally short, for example 1.1.0.
 // CI passes -PappVersion=1.1.0 when publishing a version tag.
-def appVersionName = project.findProperty("appVersion") ?: "1.2.2"
+def appVersionName = project.findProperty("appVersion") ?: "1.2.3"
 
 def getGitVersionCode() {
     try {

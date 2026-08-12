@@ -252,6 +252,7 @@
   var pageReadySent = false; // only notify Java once per page load
   var READING_SETTINGS_KEY = "twkan:readingSettings";
   var READING_POSITION_KEY = "twkan:readingPosition";
+  var READING_HISTORY_KEY = "twkan:appReadingHistory";
   var CLOUDFLARE_BLOCKED_KEY = "twkan:cloudflareBlocked";
   var READING_HISTORY_URL = "https://twkan.com/history";
 
@@ -428,6 +429,7 @@
   var initialChapterUrl = null;
   var initialChapterTitle = null;
   var currentReadingUrl = null;
+  var lastRecordedReadingUrl = null;
   var readingTrackerTimer = null;
   var cloudflareBlockedUrl = null;
   var cloudflareBlockedAt = 0;
@@ -568,13 +570,110 @@
     applyReadingSettings();
   }
 
+  function loadAppReadingHistory() {
+    var stored = null;
+    try { stored = JSON.parse(localStorage.getItem(READING_HISTORY_KEY) || "null"); } catch (e) { /* try native state */ }
+    if (!stored) {
+      try {
+        if (typeof window.TwkanBridge.loadReaderState === "function") {
+          var nativeRaw = window.TwkanBridge.loadReaderState("history");
+          if (nativeRaw) stored = JSON.parse(nativeRaw);
+        }
+      } catch (e) { /* use an empty history */ }
+    }
+    if (!Array.isArray(stored)) return [];
+
+    var valid = [];
+    for (var i = 0; i < stored.length && valid.length < 100; i++) {
+      var entry = stored[i] || {};
+      var url = normalizeUrl(entry.url);
+      if (!url || !isFinite(Number(entry.updatedAt))) continue;
+      valid.push({
+        url: url,
+        title: String(entry.title || ""),
+        updatedAt: Number(entry.updatedAt)
+      });
+    }
+    return valid;
+  }
+
+  function saveAppReadingHistory(entries) {
+    var serialized = JSON.stringify(entries);
+    try { localStorage.setItem(READING_HISTORY_KEY, serialized); } catch (e) { /* ignore */ }
+    try {
+      if (typeof window.TwkanBridge.saveReaderState === "function") {
+        window.TwkanBridge.saveReaderState("history", serialized);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   /**
-   * Navigate to the website's own reading-history page. Reading progress is
-   * tracked by the site itself via cookies/local storage, not by this reader,
-   * so no extra sync call is required here — just persist local reader state
-   * (settings + current chapter position) before leaving so it can be
-   * restored if the user comes back to this chapter later.
+   * Store only chapters confirmed by the 35% reading line. Prefetched or merely
+   * appended chapters never reach this function, so they cannot become history.
    */
+  function recordReadChapter(url, title) {
+    url = normalizeUrl(url);
+    if (!url) return;
+    var entries = loadAppReadingHistory();
+    var next = [{
+      url: url,
+      title: String(title || ""),
+      updatedAt: Date.now()
+    }];
+    for (var i = 0; i < entries.length && next.length < 100; i++) {
+      if (entries[i].url !== url) next.push(entries[i]);
+    }
+    saveAppReadingHistory(next);
+  }
+
+  function formatReadingHistoryTime(timestamp) {
+    var date = new Date(timestamp);
+    if (isNaN(date.getTime())) return "";
+    var pad = function (value) { return value < 10 ? "0" + value : String(value); };
+    return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) +
+      " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
+  }
+
+  function renderAppReadingHistory() {
+    if (!isReadingHistoryPage(document) ||
+        document.querySelector("[data-twkan-app-history='true']")) return;
+
+    var entries = loadAppReadingHistory();
+    var panel = document.createElement("section");
+    panel.setAttribute("data-twkan-reader-ui", "true");
+    panel.setAttribute("data-twkan-app-history", "true");
+
+    var heading = document.createElement("h2");
+    heading.textContent = "阅读记录";
+    panel.appendChild(heading);
+
+    var description = document.createElement("p");
+    description.textContent = entries.length
+      ? "以下记录由阅读器在章节进入阅读线后保存。"
+      : "暂无阅读记录。开始阅读并让章节进入阅读线后，记录会显示在这里。";
+    panel.appendChild(description);
+
+    if (entries.length) {
+      var list = document.createElement("ol");
+      for (var i = 0; i < entries.length; i++) {
+        var item = document.createElement("li");
+        var link = document.createElement("a");
+        link.href = entries[i].url;
+        link.textContent = entries[i].title || entries[i].url;
+        var time = document.createElement("small");
+        time.textContent = formatReadingHistoryTime(entries[i].updatedAt);
+        item.appendChild(link);
+        item.appendChild(time);
+        list.appendChild(item);
+      }
+      panel.appendChild(list);
+    }
+
+    var target = document.querySelector("main, .container, .content, #content, article") || document.body;
+    target.insertBefore(panel, target.firstChild);
+  }
+
+  /** Open the website's existing history page, then render the app's local history there. */
   function goToReadingHistory() {
     cancelScheduledAutomaticAppend();
     saveReadingSettings();
@@ -716,6 +815,15 @@
     return false;
   }
 
+  function isReadingHistoryPage(doc) {
+    try {
+      var pathname = new URL(sourceUrlFor(doc), window.location.href).pathname || "";
+      return pathname.replace(/\/+$/, "") === "/history";
+    } catch (e) {
+      return /阅读记录|閱讀記錄/.test((doc && doc.title) || "");
+    }
+  }
+
   function stopInfiniteReaderOnLibraryPage() {
     if (!infiniteInitialized || !isLibraryOrHistoryPage(document)) return false;
 
@@ -739,6 +847,7 @@
     nextAutomaticAppendAt = 0;
     cancelScheduledAutomaticAppend();
     currentReadingUrl = null;
+    lastRecordedReadingUrl = null;
     if (readingTrackerTimer !== null) {
       window.cancelAnimationFrame(readingTrackerTimer);
       readingTrackerTimer = null;
@@ -1330,24 +1439,24 @@
       window.dispatchEvent(new CustomEvent("twkan:chapterchange", { detail: detail }));
       document.dispatchEvent(new CustomEvent("chapterchange", { detail: detail }));
     } catch (e) { /* old WebView fallback */ }
-
-    // Keep the compatibility bridge call for older app builds. Current Android
-    // versions intentionally treat it as a no-op to avoid hidden network loads.
-    try {
-      if (typeof window.TwkanBridge.syncReadingRecord === "function") {
-        window.TwkanBridge.syncReadingRecord(url);
-      }
-    } catch (e) { /* ignore */ }
   }
 
   function activateReadingChapter(element, force) {
     if (!element) return;
     var url = normalizeUrl(element.getAttribute("data-chapter-url"));
-    if (!url || (!force && url === currentReadingUrl)) return;
+    if (!url || (!force && url === currentReadingUrl && url === lastRecordedReadingUrl)) return;
     var title = element.getAttribute("data-chapter-title") || initialChapterTitle || document.title;
+    var visibleTitle = element.querySelector(".twkan-appended-chapter-title, h1, h2, h3");
+    if (visibleTitle && (visibleTitle.textContent || "").trim()) {
+      title = visibleTitle.textContent.replace(/\s+/g, " ").trim();
+    }
 
     currentReadingUrl = url;
     persistLocalReadingProgress(url, title);
+    if (url !== lastRecordedReadingUrl) {
+      recordReadChapter(url, title);
+      lastRecordedReadingUrl = url;
+    }
 
     try {
       var oldState = history.state && typeof history.state === "object" ? history.state : {};
@@ -1375,18 +1484,18 @@
     var chapters = document.querySelectorAll("[data-twkan-reading-chapter='true']");
     if (!chapters.length) return;
     var readingLine = Math.max(120, window.innerHeight * 0.35);
-    var active = chapters[0];
+    var active = null;
 
     for (var i = 0; i < chapters.length; i++) {
       var rect = chapters[i].getBoundingClientRect();
-      if (rect.top <= readingLine) active = chapters[i];
       if (rect.top <= readingLine && rect.bottom > readingLine) {
         active = chapters[i];
         break;
       }
+      if (rect.bottom <= readingLine) active = chapters[i];
       if (rect.top > readingLine) break;
     }
-    activateReadingChapter(active, false);
+    if (active) activateReadingChapter(active, false);
   }
 
   function saveReadingPositionSoon() {
@@ -1714,7 +1823,14 @@
   }
 
   function initInfiniteReader() {
-    if (stopInfiniteReaderOnLibraryPage()) return;
+    if (isReadingHistoryPage(document)) {
+      renderAppReadingHistory();
+      return;
+    }
+    if (stopInfiniteReaderOnLibraryPage()) {
+      renderAppReadingHistory();
+      return;
+    }
     if (infiniteInitialized) return;
 
     var nextInfo = findNextChapter(document);
@@ -1841,6 +1957,7 @@
     loadReadingSettings();
     schedule(document.body || document.documentElement, true /* isFirstPass */);
     initAdBlocker();
+    if (isReadingHistoryPage(document)) renderAppReadingHistory();
     setTimeout(initInfiniteReader, 500);
   };
 
@@ -1853,7 +1970,10 @@
   // ─── MutationObserver (subsequent updates, not first pass) ────────────────
   var observer = new MutationObserver(function (mutations) {
     if (converting) return;
-    if (stopInfiniteReaderOnLibraryPage()) return;
+    if (stopInfiniteReaderOnLibraryPage()) {
+      renderAppReadingHistory();
+      return;
+    }
     for (var i = 0; i < mutations.length; i++) {
       var m = mutations[i];
       var target = m.target && m.target.nodeType === Node.ELEMENT_NODE
@@ -1914,6 +2034,13 @@
     '.twkan-settings-value { text-align: right !important; color: #666 !important; font-variant-numeric: tabular-nums !important; }',
     '.twkan-settings-reset { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #bbb !important; border-radius: 6px !important; background: #f5f5f5 !important; color: #222 !important; }',
     '.twkan-settings-history { width: 100% !important; margin-top: 8px !important; padding: 8px !important; border: 1px solid #7a9dd6 !important; border-radius: 6px !important; background: #eef3fc !important; color: #22468c !important; }',
+    '[data-twkan-app-history="true"] { margin: 14px auto 22px !important; padding: 14px !important; max-width: 720px !important; border: 1px solid rgba(0,0,0,.14) !important; border-radius: 8px !important; background: var(--twkan-reader-background, #fff) !important; color: var(--twkan-reader-foreground, #202124) !important; font-family: sans-serif !important; }',
+    '[data-twkan-app-history="true"] h2 { margin: 0 0 8px !important; font-size: 20px !important; }',
+    '[data-twkan-app-history="true"] p { margin: 0 0 10px !important; color: #666 !important; font-size: 14px !important; }',
+    '[data-twkan-app-history="true"] ol { margin: 0 !important; padding-left: 22px !important; }',
+    '[data-twkan-app-history="true"] li { margin: 10px 0 !important; }',
+    '[data-twkan-app-history="true"] a { display: block !important; color: #22468c !important; text-decoration: none !important; }',
+    '[data-twkan-app-history="true"] small { display: block !important; margin-top: 3px !important; color: #777 !important; font-size: 12px !important; }',
 
     '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; }',
     '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 28px auto 18px !important; background: rgba(127,127,127,.32) !important; }',
