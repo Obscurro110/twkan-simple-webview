@@ -745,12 +745,13 @@
     if (stored.pageUrl && stored.pageUrl !== currentPageUrl) return;
     if (stored.chapterUrl && stored.chapterUrl !== initialChapterUrl) return;
     cancelReadingPositionRestore();
-    var restored = false;
+    var attempts = 0;
     function restore() {
-      if (restored) return;
-      restored = true;
-      readingPositionRestoreTimer = null;
-      if (stored.chapterUrl && currentReadingUrl && stored.chapterUrl !== currentReadingUrl) return;
+      attempts++;
+      if (stored.chapterUrl && currentReadingUrl && stored.chapterUrl !== currentReadingUrl) {
+        if (attempts < 12) readingPositionRestoreTimer = window.setTimeout(restore, 250);
+        return;
+      }
       var targetY = Math.max(0, Number(stored.scrollY));
       var restoredChapter = document.querySelector("[data-twkan-reading-chapter='true']");
       if (restoredChapter && isFinite(Number(stored.chapterOffset))) {
@@ -760,21 +761,16 @@
         var safeOffset = Math.min(Math.max(0, Number(stored.chapterOffset)), maxOffset);
         targetY = Math.max(0, top + safeOffset);
       }
-      if (Math.abs((window.scrollY || window.pageYOffset || 0) - targetY) > 60) {
-        window.scrollTo(0, targetY);
+      window.scrollTo(0, targetY);
+      if (attempts < 3) {
+        readingPositionRestoreTimer = window.setTimeout(restore, 300);
+      } else {
+        readingPositionRestoreTimer = null;
       }
     }
-    readingPositionRestoreTimer = window.setTimeout(restore, 180);
-    var cancelOnInput = function () {
-      if (!restored) {
-        restored = true;
-        cancelReadingPositionRestore();
-      }
-    };
-    window.addEventListener("touchstart", cancelOnInput, { once: true, passive: true });
-    window.addEventListener("wheel", cancelOnInput, { once: true, passive: true });
-    window.addEventListener("pointerdown", cancelOnInput, { once: true, passive: true });
-    window.addEventListener("keydown", cancelOnInput, { once: true });
+    readingPositionRestoreTimer = window.setTimeout(restore, 120);
+    window.addEventListener("touchstart", cancelReadingPositionRestore, { once: true, passive: true });
+    window.addEventListener("wheel", cancelReadingPositionRestore, { once: true, passive: true });
   }
 
 
@@ -1842,13 +1838,11 @@
     if (!contentRoot || !isLikelyChapterPage(document, contentRoot, nextInfo)) return;
 
     infiniteInitialized = true;
-    // Prevent the browser from auto-restoring scroll position when
-    // history.replaceState changes the URL as the reading line crosses chapter
-    // boundaries. Without this, Android WebView jumps back to the position it
-    // remembers for the newly-active URL, causing the sporadic scroll jumps.
-    try {
-      if (history.scrollRestoration) history.scrollRestoration = "manual";
-    } catch (e) { /* not supported; ignore */ }
+    // Disable browser scroll restoration so that history.replaceState() calls
+    // (which update the URL bar as the reading line crosses chapter boundaries)
+    // do not cause Android WebView to jump back to a previously remembered
+    // scroll position for that URL.
+    try { if (history.scrollRestoration) history.scrollRestoration = "manual"; } catch (e) {}
     initialChapterUrl = normalizeUrl(sourceUrlFor(document));
     initialChapterTitle = getChapterTitle(document, contentRoot) || document.title;
     removePromotionalText(contentRoot);
@@ -2025,7 +2019,7 @@
     'iframe[src*="googlesyndication"] { display: none !important; }',
     '[class*="banner"] { display: none !important; }',
     '[id*="banner"] { display: none !important; }',
-    '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; overflow-anchor: none !important; }',
+    '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
     'html[data-twkan-reader-bg], body[data-twkan-reader-bg] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reader-surface="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reading-chapter="true"], [data-twkan-reading-chapter="true"] *:not(img), .twkan-appended-chapter-body, .twkan-appended-chapter-body *:not(img) { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; opacity: 1 !important; }',
@@ -2053,9 +2047,8 @@
     '[data-twkan-app-history="true"] a { display: block !important; color: #22468c !important; text-decoration: none !important; }',
     '[data-twkan-app-history="true"] small { display: block !important; margin-top: 3px !important; color: #777 !important; font-size: 12px !important; }',
 
-    '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow-anchor: auto !important; }',
+    '.twkan-infinite-chapter { display: block !important; width: 100% !important; clear: both !important; height: auto !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; }',
     '.twkan-chapter-separator { display: block !important; width: 72% !important; height: 1px !important; margin: 28px auto 18px !important; background: rgba(127,127,127,.32) !important; }',
-    '.twkan-infinite-sentinel { display: block !important; width: 1px !important; height: 1px !important; overflow-anchor: none !important; }',
     '[data-twkan-reading-chapter="true"] { height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important; font-size: var(--twkan-reader-font-size) !important; line-height: var(--twkan-reader-line-height) !important; letter-spacing: var(--twkan-reader-letter-spacing) !important; background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reading-chapter="true"] > h1, [data-twkan-reading-chapter="true"] > h2, [data-twkan-reading-chapter="true"] > h3 { margin-top: 0 !important; margin-bottom: 6px !important; padding-top: 0 !important; padding-bottom: 0 !important; height: auto !important; min-height: 0 !important; font-size: calc(var(--twkan-reader-font-size) * 1.35) !important; line-height: 1.55 !important; letter-spacing: var(--twkan-reader-letter-spacing) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reading-chapter="true"] p { margin-top: 0 !important; margin-bottom: 1em !important; }',
@@ -2065,7 +2058,8 @@
     '.twkan-appended-chapter-body > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }',
     '.twkan-appended-chapter-body img { max-width: 100% !important; height: auto !important; }',
     '.twkan-infinite-status { position: relative !important; z-index: 2147482000 !important; display: block; margin: 18px auto !important; padding: 20px 12px !important; max-width: 92% !important; border-radius: 10px !important; background: var(--twkan-reader-background) !important; text-align: center !important; color: #777 !important; font-size: 14px !important; }',
-    '.twkan-infinite-error { border: 1px solid rgba(184,92,0,.45) !important; color: #b85c00 !important; font-weight: 700 !important; cursor: pointer !important; }'
+    '.twkan-infinite-error { border: 1px solid rgba(184,92,0,.45) !important; color: #b85c00 !important; font-weight: 700 !important; cursor: pointer !important; }',
+    '.twkan-infinite-sentinel { display: block !important; width: 1px !important; height: 1px !important; }'
   ].join("\n");
   document.head.appendChild(style);
 }());
