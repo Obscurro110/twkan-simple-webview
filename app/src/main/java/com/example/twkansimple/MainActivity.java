@@ -47,12 +47,12 @@ public class MainActivity extends Activity {
     private static final String PREF_READING_SETTINGS = "reading_settings";
     private static final String PREF_READING_POSITION = "reading_position";
     private static final int SHOW_TIMEOUT_MS = 1500;
-    /**
-     * Cloudflare's pass cookie. It is HttpOnly, so page JavaScript cannot read
-     * it; only CookieManager can. The bridge exposes presence as a boolean and
-     * never returns the value itself.
-     */
-    private static final String CLEARANCE_COOKIE_NAME = "cf_clearance";
+    private static final String CHALLENGE_PAGE_DETECTOR =
+            "(function(){var html=document.documentElement?document.documentElement.outerHTML:'';"
+                    + "return /cf-chl-|challenge-platform|Just a moment|Checking your browser|"
+                    + "Checking if the site connection is secure|Enable JavaScript and cookies to continue|"
+                    + "验证您是真人|驗證您是真人/i.test(html);"
+                    + "})()";
 
     /** Ad/tracker domains to block at the network layer. */
     private static final Set<String> AD_HOSTS = new HashSet<>(Arrays.asList(
@@ -80,15 +80,6 @@ public class MainActivity extends Activity {
             "adsafeprotected.com",
             "moatads.com"
     ));
-
-    private static String getCompatibleUserAgent(WebSettings settings) {
-        String userAgent = settings.getUserAgentString();
-        if (userAgent == null || userAgent.isEmpty()) return null;
-        // Keep the actual Android WebView/Chrome version and only remove the
-        // WebView marker. A fabricated Chrome version can trigger bot checks.
-        return userAgent.replaceAll("; wv\\)", ")")
-                .replaceAll("\\s+wv(?:\\s|$)", " ");
-    }
 
     private static final byte[] EMPTY_GIF = {
         0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,(byte)0x80,
@@ -123,6 +114,10 @@ public class MainActivity extends Activity {
     private String simplifierScript;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable showPageRunnable;
+    private volatile boolean keepVisibleForVerificationNavigation;
+    private boolean visibleVerificationNavigationInProgress;
+    private int mainFrameNavigationSequence;
+    private int visibleVerificationHttpStatus;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -301,12 +296,8 @@ public class MainActivity extends Activity {
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     private void configureWebView() {
         WebSettings settings = webView.getSettings();
-        // Keep the device WebView's real Chrome version and remove only the
-        // WebView marker. This is more consistent with the actual browser.
-        String compatibleUserAgent = getCompatibleUserAgent(settings);
-        if (compatibleUserAgent != null) {
-            settings.setUserAgentString(compatibleUserAgent);
-        }
+        // Keep the Android System WebView default User-Agent so its declared
+        // identity remains consistent with the browser engine in this session.
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
@@ -362,23 +353,56 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 pageLoadFailed = false;
+                mainFrameNavigationSequence++;
+                visibleVerificationHttpStatus = 0;
                 hideNetworkError();
-                // Hide the WebView immediately when a new page starts loading
-                // so the user never sees raw traditional Chinese text flash.
                 if (isTwkanHost(Uri.parse(url).getHost())) {
-                    webView.setVisibility(View.INVISIBLE);
-                    // Safety timeout: always show after 1.5s even if JS didn't call back
                     cancelShowTimeout();
-                    showPageRunnable = () -> showWebView();
-                    mainHandler.postDelayed(showPageRunnable, SHOW_TIMEOUT_MS);
+                    if (keepVisibleForVerificationNavigation) {
+                        // This top-level navigation was explicitly requested from
+                        // the reader's verification prompt. Keep every challenge
+                        // control visible from the first paint and across redirects.
+                        keepVisibleForVerificationNavigation = false;
+                        visibleVerificationNavigationInProgress = true;
+                        webView.setVisibility(View.VISIBLE);
+                    } else if (!visibleVerificationNavigationInProgress) {
+                        // Hide normal chapter loads briefly so raw traditional
+                        // Chinese does not flash before the simplifier runs.
+                        webView.setVisibility(View.INVISIBLE);
+                        showPageRunnable = () -> showWebView();
+                        mainHandler.postDelayed(showPageRunnable, SHOW_TIMEOUT_MS);
+                    }
                 }
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                if (!pageLoadFailed) {
-                    injectSimplifier(url);
+                if (pageLoadFailed) {
+                    visibleVerificationNavigationInProgress = false;
+                    return;
                 }
+                if (!visibleVerificationNavigationInProgress) {
+                    injectSimplifier(url);
+                    return;
+                }
+
+                final int navigationSequence = mainFrameNavigationSequence;
+                view.evaluateJavascript(CHALLENGE_PAGE_DETECTOR, value -> {
+                    if (navigationSequence != mainFrameNavigationSequence) return;
+                    if ("true".equals(value)) {
+                        // Keep the challenge page visible and untouched until
+                        // the website redirects to the completed destination.
+                        return;
+                    }
+                    visibleVerificationNavigationInProgress = false;
+                    if (visibleVerificationHttpStatus == 403) {
+                        pageLoadFailed = true;
+                        showNetworkError(url, getString(R.string.http_error_detail, 403));
+                        return;
+                    }
+                    CookieManager.getInstance().flush();
+                    injectSimplifier(url);
+                });
             }
 
             @Override
@@ -415,8 +439,15 @@ public class MainActivity extends Activity {
             public void onReceivedHttpError(WebView view, WebResourceRequest request,
                                             WebResourceResponse errorResponse) {
                 if (request.isForMainFrame()) {
-                    pageLoadFailed = true;
                     int statusCode = errorResponse != null ? errorResponse.getStatusCode() : 0;
+                    if (visibleVerificationNavigationInProgress && statusCode == 403) {
+                        // A challenge page can be delivered with HTTP 403. It is
+                        // still the page where the user must interact, so do not
+                        // replace it with the app's generic error overlay.
+                        visibleVerificationHttpStatus = statusCode;
+                        return;
+                    }
+                    pageLoadFailed = true;
                     showNetworkError(request.getUrl() != null
                                     ? request.getUrl().toString() : view.getUrl(),
                             getString(R.string.http_error_detail, statusCode));
@@ -556,6 +587,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        CookieManager.getInstance().flush();
         webView.onPause();
         super.onPause();
     }
@@ -628,34 +660,19 @@ public class MainActivity extends Activity {
         }
 
         /**
-         * Reports whether a Cloudflare clearance cookie is currently present for
-         * twkan.com. The cookie itself is HttpOnly, so page scripts cannot see
-         * it; only this boolean is exposed, never the token value. The reader
-         * uses it to decide whether a plain background request is likely to be
-         * accepted, instead of guessing from "how long ago did a challenge fail".
+         * The reader is about to navigate the visible WebView to a page where
+         * the user may need to complete a site challenge. This flag affects only
+         * the next top-level page's visibility; it neither reads nor exposes
+         * cookies or challenge data.
          */
         @JavascriptInterface
-        public boolean hasCloudflareClearance() {
-            try {
-                String cookies = CookieManager.getInstance().getCookie(HOME_URL);
-                if (cookies == null || cookies.isEmpty()) {
-                    return false;
-                }
-                for (String entry : cookies.split(";")) {
-                    String trimmed = entry.trim();
-                    if (!trimmed.startsWith(CLEARANCE_COOKIE_NAME + "=")) {
-                        continue;
-                    }
-                    // An empty or placeholder value means the cookie was
-                    // cleared/expired rather than freshly issued.
-                    return trimmed.length() > CLEARANCE_COOKIE_NAME.length() + 1;
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "Unable to read clearance cookie state", e);
-            }
-            return false;
+        public void prepareVisibleVerificationNavigation() {
+            keepVisibleForVerificationNavigation = true;
+            mainHandler.post(() -> {
+                cancelShowTimeout();
+                webView.setVisibility(View.VISIBLE);
+            });
         }
-
 
         @JavascriptInterface
         public String toSimplified(String text) {

@@ -253,7 +253,6 @@
   var READING_SETTINGS_KEY = "twkan:readingSettings";
   var READING_POSITION_KEY = "twkan:readingPosition";
   var CLOUDFLARE_BLOCKED_KEY = "twkan:cloudflareBlocked";
-  var CLOUDFLARE_CHALLENGE_KEY = "twkan:cloudflareChallengeSeen";
   var READING_HISTORY_URL = "https://twkan.com/history";
 
 
@@ -412,12 +411,8 @@
   var PREFETCH_AHEAD = 0;
   var AUTO_APPEND_ROOT_MARGIN_PX = 900;
   var AUTO_APPEND_MIN_INTERVAL_MS = 3000;
-  // Fallback grace window, only used on older app builds whose bridge cannot
-  // report clearance-cookie presence.
-  var CLOUDFLARE_CHALLENGE_GRACE_MS = 15 * 60 * 1000;
-  // Clearance presence is stable for a while; cache it so a burst of chapter
-  // requests does not cross the JS/Java bridge repeatedly.
-  var CLEARANCE_PROBE_TTL_MS = 20 * 1000;
+  var RATE_LIMIT_DEFAULT_RETRY_MS = 30 * 1000;
+  var RATE_LIMIT_MAX_RETRY_MS = 5 * 60 * 1000;
   var chapterCache = Object.create(null);
   var chapterRequests = Object.create(null);
   var appendedUrls = Object.create(null);
@@ -436,23 +431,8 @@
   var readingTrackerTimer = null;
   var cloudflareBlockedUrl = null;
   var cloudflareBlockedAt = 0;
-  var cloudflareChallengeSeenAt = 0;
-  // Cached answer from the bridge's clearance-cookie check, plus when it was
-  // taken. null/0 means "not probed yet in this window".
-  var clearanceCached = false;
-  var clearanceProbedAt = 0;
-  // Tracks cleanup callbacks for in-flight hidden-iframe Cloudflare probes,
-  // so navigating away from the reader (library/history page, or the whole
-  // page unloading) can force-stop any pending polling timers instead of
-  // leaking them.
-  var activeIframeCleanups = [];
-
-  function cancelActiveIframeProbes() {
-    while (activeIframeCleanups.length) {
-      var cleanupFn = activeIframeCleanups.pop();
-      try { cleanupFn(); } catch (e) { /* ignore */ }
-    }
-  }
+  var rateLimitedUrl = null;
+  var rateLimitedUntil = 0;
 
   function cancelScheduledAutomaticAppend() {
     if (automaticAppendTimer !== null) {
@@ -596,7 +576,6 @@
    * restored if the user comes back to this chapter later.
    */
   function goToReadingHistory() {
-    cancelActiveIframeProbes();
     cancelScheduledAutomaticAppend();
     saveReadingSettings();
     saveReadingPosition();
@@ -739,8 +718,6 @@
 
   function stopInfiniteReaderOnLibraryPage() {
     if (!infiniteInitialized || !isLibraryOrHistoryPage(document)) return false;
-
-    cancelActiveIframeProbes();
 
     var managed = document.querySelectorAll("[data-twkan-infinite-managed='true']");
     for (var i = managed.length - 1; i >= 0; i--) managed[i].remove();
@@ -1171,80 +1148,58 @@
     return /cf-chl-|challenge-platform|Just a moment|验证您是真人|驗證您是真人|Checking your browser|Checking if the site connection is secure|Enable JavaScript and cookies to continue/i.test(html || "");
   }
 
-  function noteCloudflareChallenge() {
-    cloudflareChallengeSeenAt = Date.now();
-    // A challenge just came back, so any cached "clearance present" answer is
-    // stale: the cookie was either never valid or has just been rejected.
-    // Force a fresh probe rather than letting the TTL keep the old answer.
-    clearanceCached = false;
-    clearanceProbedAt = 0;
-    try { localStorage.setItem(CLOUDFLARE_CHALLENGE_KEY, String(cloudflareChallengeSeenAt)); } catch (e) { /* ignore */ }
-  }
-
-  /** A successful load proves the current session is accepted again. */
-  function noteCloudflareCleared() {
-    cloudflareChallengeSeenAt = 0;
-    clearanceProbedAt = 0;
-    try { localStorage.removeItem(CLOUDFLARE_CHALLENGE_KEY); } catch (e) { /* ignore */ }
-  }
-
-  function loadCloudflareChallengeState() {
-    try {
-      var seenAt = Number(localStorage.getItem(CLOUDFLARE_CHALLENGE_KEY) || 0);
-      if (seenAt > 0 && Date.now() - seenAt < CLOUDFLARE_CHALLENGE_GRACE_MS) {
-        cloudflareChallengeSeenAt = seenAt;
-      } else {
-        localStorage.removeItem(CLOUDFLARE_CHALLENGE_KEY);
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  /**
-   * Cloudflare issues a clearance cookie once a challenge has been passed. It is
-   * HttpOnly, so this page cannot read it directly; the Android bridge reports
-   * only whether it exists. Holding it is a far more accurate signal than
-   * guessing from "how long ago did a challenge fail", so a plain background
-   * request is only attempted while the session actually holds clearance.
-   *
-   * The result is cached briefly so a burst of chapter requests does not call
-   * across the bridge repeatedly.
-   */
-  function hasCloudflareClearance() {
-    var now = Date.now();
-    if (clearanceProbedAt > 0 && now - clearanceProbedAt < CLEARANCE_PROBE_TTL_MS) {
-      return clearanceCached;
+  function isCloudflareChallengeResponse(response, html) {
+    if (response && typeof response.headers !== "undefined") {
+      try {
+        if ((response.headers.get("cf-mitigated") || "").toLowerCase() === "challenge") {
+          return true;
+        }
+      } catch (e) { /* fall back to challenge markup */ }
     }
-    var available = null;
-    try {
-      if (typeof window.TwkanBridge.hasCloudflareClearance === "function") {
-        available = window.TwkanBridge.hasCloudflareClearance() === true;
-      }
-    } catch (e) { /* bridge unavailable; fall back to the timing heuristic */ }
-    if (available === null) return null;
-    clearanceCached = available;
-    clearanceProbedAt = now;
-    return available;
+    return isCloudflareChallenge(html);
   }
 
-  function shouldUseCloudflareIframeFirst() {
-    // Holding clearance means a plain background request is expected to be
-    // accepted, so use the cheap path even if a challenge happened earlier.
-    if (hasCloudflareClearance() === true) return false;
+  function parseRetryAfterMs(response) {
+    var raw = null;
+    try { raw = response.headers.get("Retry-After"); } catch (e) { /* use default */ }
+    if (!raw) return RATE_LIMIT_DEFAULT_RETRY_MS;
+    var seconds = Number(raw);
+    if (isFinite(seconds) && seconds >= 0) {
+      return Math.min(RATE_LIMIT_MAX_RETRY_MS, Math.round(seconds * 1000));
+    }
+    var retryAt = Date.parse(raw);
+    if (!isNaN(retryAt)) {
+      return Math.min(RATE_LIMIT_MAX_RETRY_MS, Math.max(0, retryAt - Date.now()));
+    }
+    return RATE_LIMIT_DEFAULT_RETRY_MS;
+  }
 
-    // Missing clearance on its own proves nothing: when the site is not
-    // challenging at all, no clearance cookie is ever issued and a plain fetch
-    // works fine. Only switch to the slower real-page channel when a challenge
-    // was actually observed recently.
-    return cloudflareChallengeSeenAt > 0 &&
-      Date.now() - cloudflareChallengeSeenAt < CLOUDFLARE_CHALLENGE_GRACE_MS;
+  function rateLimitMessage() {
+    var remaining = Math.max(0, rateLimitedUntil - Date.now());
+    return "请求过于频繁，请在" + Math.max(1, Math.ceil(remaining / 1000)) + "秒后重试";
+  }
+
+  function noteRateLimited(url, response) {
+    rateLimitedUrl = normalizeUrl(url);
+    rateLimitedUntil = Date.now() + parseRetryAfterMs(response);
+  }
+
+  function clearRateLimited(url) {
+    if (!url || rateLimitedUrl === normalizeUrl(url)) {
+      rateLimitedUrl = null;
+      rateLimitedUntil = 0;
+    }
   }
 
   function isCloudflareError(error) {
-    return /Cloudflare|HTTP (403|429)/i.test(error && error.message || "");
+    return /Cloudflare challenge/i.test(error && error.message || "");
+  }
+
+  function isRateLimitError(error) {
+    return /Rate limited/i.test(error && error.message || "");
   }
 
   function setCloudflareBlocked(url) {
-    noteCloudflareChallenge();
     cloudflareBlockedUrl = normalizeUrl(url);
     cloudflareBlockedAt = Date.now();
     try {
@@ -1267,195 +1222,60 @@
     } catch (e) { /* ignore */ }
   }
 
-  function clearCloudflareBlocked() {
-    cloudflareBlockedUrl = null;
-    cloudflareBlockedAt = 0;
-    try { localStorage.removeItem(CLOUDFLARE_BLOCKED_KEY); } catch (e) { /* ignore */ }
+  function clearCloudflareBlocked(url) {
+    if (!url || cloudflareBlockedUrl === normalizeUrl(url)) {
+      cloudflareBlockedUrl = null;
+      cloudflareBlockedAt = 0;
+      try { localStorage.removeItem(CLOUDFLARE_BLOCKED_KEY); } catch (e) { /* ignore */ }
+    }
   }
-
 
   function openChapterInVisibleReader(url) {
     if (!url) return;
-    cancelActiveIframeProbes();
     cancelScheduledAutomaticAppend();
     setCloudflareBlocked(url);
     saveReadingSettings();
     saveReadingPosition();
+    try {
+      if (typeof window.TwkanBridge.prepareVisibleVerificationNavigation === "function") {
+        window.TwkanBridge.prepareVisibleVerificationNavigation();
+      }
+    } catch (e) { /* visible navigation still works without the bridge */ }
     setLoadingState("正在打开下一章，请在当前页面完成网站验证…", false);
     window.location.href = url;
   }
 
-  /**
-   * fetch() only downloads bytes; it never executes the returned <script>.
-   * Cloudflare's non-interactive "Just a moment..." JS challenge only clears
-   * once its script actually *runs* in a real page context and sets a pass
-   * cookie. That is why a background fetch() to the next chapter fails almost
-   * every time a challenge is active, even though a normal page load would
-   * pass silently within a few seconds. To avoid surfacing that failure to
-   * the user, load the same URL once in a hidden same-origin <iframe> (a real
-   * execution context) and poll its document until the challenge markup is
-   * gone. This resolves automatically for non-interactive challenges without
-   * any visible UI; only challenges that truly require human interaction
-   * (slider/captcha) will still time out and fall through to the existing
-   * "点击打开下一章" visible-WebView flow.
-   */
-  function fetchChapterViaHiddenIframe(url) {
-    return new Promise(function (resolve, reject) {
-      var settled = false;
-      var pollTimer = null;
-      var timeoutTimer = null;
-      var iframe = document.createElement("iframe");
-      iframe.setAttribute("aria-hidden", "true");
-      iframe.setAttribute("tabindex", "-1");
-      // Some Cloudflare challenge pages try to bust out of frames
-      // ("if (top.location !== self.location) top.location = ...") to force
-      // full-page display. Sandboxing without allow-top-navigation blocks
-      // that redirect attempt while still letting the challenge script run
-      // and access its own same-origin document.
-      iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms");
-      iframe.style.position = "fixed";
-      iframe.style.top = "-9999px";
-      iframe.style.left = "-9999px";
-      iframe.style.width = "1px";
-      iframe.style.height = "1px";
-      iframe.style.opacity = "0";
-      iframe.style.border = "0";
-      iframe.style.pointerEvents = "none";
-
-      function cleanup() {
-        if (pollTimer !== null) window.clearInterval(pollTimer);
-        if (timeoutTimer !== null) window.clearTimeout(timeoutTimer);
-        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-        var idx = activeIframeCleanups.indexOf(cleanupEntry);
-        if (idx !== -1) activeIframeCleanups.splice(idx, 1);
-      }
-
-      // Registered so a page-level navigation-away event (leaving the
-      // reader, or the whole page unloading) can force this probe to stop
-      // immediately instead of polling a detached/stale iframe forever.
-      function cleanupEntry() {
-        fail("Reader navigated away");
-      }
-      activeIframeCleanups.push(cleanupEntry);
-
-      function finish(html) {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(html);
-      }
-
-      function fail(reason) {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(new Error(reason || "Cloudflare challenge"));
-      }
-
-      var attempts = 0;
-      var maxAttempts = 48; // ~250ms * 48 = 12s, generous for a JS challenge
-
-      pollTimer = window.setInterval(function () {
-        attempts++;
-        var doc;
-        try {
-          doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
-        } catch (e) {
-          fail("Cross-origin iframe");
-          return;
-        }
-        if (!doc || !doc.documentElement || !doc.body || doc.readyState !== "complete") {
-          if (attempts >= maxAttempts) fail("Cloudflare challenge timeout");
-          return;
-        }
-        var html = doc.documentElement.outerHTML || "";
-        var hasText = doc.body.textContent && doc.body.textContent.trim().length > 40;
-        // Guard against a transient redirect/meta-refresh stub page (e.g.
-        // "Redirecting...") being mistaken for the final loaded chapter: the
-        // iframe's own location should have settled on the requested URL.
-        var locationSettled = true;
-        try {
-          locationSettled = !iframe.contentWindow || !iframe.contentWindow.location ||
-            normalizeUrl(iframe.contentWindow.location.href) === url;
-        } catch (e) { /* cross-origin during redirect; keep polling */ }
-        if (hasText && locationSettled && !isCloudflareChallenge(html)) {
-          finish(html);
-        } else if (attempts >= maxAttempts) {
-          fail("Cloudflare challenge timeout");
-        }
-      }, 250);
-
-      timeoutTimer = window.setTimeout(function () {
-        fail("Cloudflare challenge timeout");
-      }, 13000);
-
-      iframe.addEventListener("error", function () {
-        fail("Iframe load error");
-      });
-
-      iframe.src = url;
-      document.body.appendChild(iframe);
-    });
-  }
-
-  /** Fetch and parse once; keep the actual chapter in memory, not only HTTP cache. */
+  /** Fetch and parse once; never run challenge scripts in a hidden context. */
   function fetchChapter(url) {
     url = normalizeUrl(url);
     if (!url) return Promise.reject(new Error("Invalid chapter URL"));
     if (chapterCache[url]) return Promise.resolve(chapterCache[url]);
     if (chapterRequests[url]) return chapterRequests[url];
-
-    // Whether this chapter ultimately came through the hidden real-page channel.
-    // Used below to decide if the challenge marker may be dropped.
-    var usedRealPageChannel = false;
-
-    var htmlPromise;
-    if (shouldUseCloudflareIframeFirst()) {
-      usedRealPageChannel = true;
-      // Without a clearance cookie a plain fetch would almost certainly receive
-      // a challenge page it cannot execute. Skip it and spend the single
-      // request on a real page context, which can satisfy the challenge and
-      // have the clearance cookie issued.
-      htmlPromise = fetchChapterViaHiddenIframe(url).catch(function () {
-        setCloudflareBlocked(url);
-        throw new Error("Cloudflare challenge");
-      });
-    } else {
-      htmlPromise = fetch(url, {
-        credentials: "include",
-        cache: "default",
-        redirect: "follow"
-      })
-        .then(function (response) {
-          if (!response.ok) {
-            // Cloudflare sometimes rejects the raw fetch outright (403/429)
-            // instead of returning challenge HTML. Record that signal before
-            // retrying once in a real page context.
-            if (response.status === 403 || response.status === 429) {
-              noteCloudflareChallenge();
-              usedRealPageChannel = true;
-              return fetchChapterViaHiddenIframe(url).catch(function () {
-                setCloudflareBlocked(url);
-                throw new Error("HTTP " + response.status);
-              });
-            }
-            throw new Error("HTTP " + response.status);
-          }
-          return response.text();
-        })
-        .then(function (html) {
-          if (!isCloudflareChallenge(html)) return html;
-          noteCloudflareChallenge();
-          usedRealPageChannel = true;
-          // The raw fetch cannot execute a JS challenge. Retry once in the
-          // hidden real-page context, then stop on failure rather than making
-          // additional background requests.
-          return fetchChapterViaHiddenIframe(url).catch(function () {
-            setCloudflareBlocked(url);
-            throw new Error("Cloudflare challenge");
-          });
-        });
+    if (rateLimitedUrl === url) {
+      if (Date.now() < rateLimitedUntil) {
+        return Promise.reject(new Error("Rate limited"));
+      }
+      clearRateLimited(url);
     }
+
+    var htmlPromise = fetch(url, {
+      credentials: "include",
+      cache: "default",
+      redirect: "follow"
+    }).then(function (response) {
+      if (response.status === 429) {
+        noteRateLimited(url, response);
+        throw new Error("Rate limited");
+      }
+      return response.text().then(function (html) {
+        if (isCloudflareChallengeResponse(response, html)) {
+          setCloudflareBlocked(url);
+          throw new Error("Cloudflare challenge");
+        }
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return html;
+      });
+    });
 
     chapterRequests[url] = htmlPromise
       .then(function (html) {
@@ -1464,19 +1284,8 @@
         var chapter = extractChapter(doc, url);
         chapterCache[url] = chapter;
         delete chapterRequests[url];
-        // A real chapter came back. Drop the challenge marker so reading can
-        // return to the cheaper plain-fetch path — but only when that is
-        // actually safe:
-        //   * plain fetch succeeded  → the session is plainly accepted;
-        //   * real-page channel used → only if clearance was issued, otherwise
-        //     the next plain fetch would just hit the challenge again and turn
-        //     every chapter into two requests.
-        if (!usedRealPageChannel) {
-          noteCloudflareCleared();
-        } else {
-          clearanceProbedAt = 0;
-          if (hasCloudflareClearance() === true) noteCloudflareCleared();
-        }
+        clearCloudflareBlocked(url);
+        clearRateLimited(url);
         return chapter;
       })
       .catch(function (error) {
@@ -1590,7 +1399,6 @@
 
   function persistReaderStateNow() {
     if (!infiniteInitialized) return;
-    cancelActiveIframeProbes();
     cancelScheduledAutomaticAppend();
     saveReadingSettings();
     saveReadingPosition();
@@ -1699,6 +1507,8 @@
         if (isCloudflareError(error)) {
           setCloudflareBlocked(requestedUrl);
           setLoadingState("网站要求验证，点这里打开下一章", true);
+        } else if (isRateLimitError(error)) {
+          setLoadingState(rateLimitMessage(), true);
         } else {
           setLoadingState("下一章加载失败，点这里重试", true);
         }
@@ -1920,7 +1730,6 @@
     currentReadingUrl = initialChapterUrl;
     nextChapterUrl = nextInfo ? normalizeUrl(nextInfo.url) : null;
     appendedUrls[initialChapterUrl] = true;
-    loadCloudflareChallengeState();
     loadCloudflareBlocked();
     if (cloudflareBlockedUrl && cloudflareBlockedUrl !== nextChapterUrl) clearCloudflareBlocked();
 
