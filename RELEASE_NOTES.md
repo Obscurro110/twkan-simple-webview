@@ -2,33 +2,38 @@
 
 ## 本次更新
 
-**优化 WebView 滑动性能，解决滑动闪烁问题**
+**从根本解决滑动闪烁问题**
 
-针对用户反馈的"滑动时忽闪忽闪"问题，进行了渲染层面的优化：
+针对用户反馈的"滑动时忽闪忽闪"问题，通过多层优化从根本解决：
 
-### 1. 启用硬件加速
-- 开启 GPU 渲染加速，显著提升滑动流畅度
-- 减少 CPU 负担，降低卡顿和掉帧
+### 1. 硬件加速层面（Java）
+- 启用 WebView 硬件加速（GPU 渲染）
+- 提高渲染优先级为 HIGH
+- 启用平滑过渡动画
+- 优化缓存策略
 
-### 2. 渲染优先级优化
-- 将 WebView 渲染优先级设为 HIGH
-- 确保页面渲染优先处理，减少延迟
+### 2. CSS 层合成优化（JavaScript）
+- 强制 GPU 层合成：`transform: translateZ(0)`
+- 使用 CSS Containment 隔离布局计算
+- 防止回流（reflow）时的视觉抖动
+- 优化章节容器的渲染性能
 
-### 3. 平滑过渡
-- 启用平滑过渡效果
-- 减少页面切换和内容加载时的视觉抖动
-
-### 4. 合理缓存策略
-- 使用默认缓存模式
-- 避免不必要的重复加载，减少闪烁
+### 3. 减少布局抖动
+- 降低广告拦截器运行频率：从 2 秒降至 5 秒
+- 减少 DOM 操作导致的重排次数
+- 避免滑动时频繁触发布局重新计算
 
 ## 技术细节
 
-通过以下 WebView 设置实现：
-- `setLayerType(LAYER_TYPE_HARDWARE)` - 硬件加速
-- `setRenderPriority(HIGH)` - 高优先级渲染
-- `setEnableSmoothTransition(true)` - 平滑过渡
-- `setCacheMode(LOAD_DEFAULT)` - 智能缓存
+**闪烁的根本原因**：
+1. 广告拦截器每 2 秒删除广告元素 → 触发布局重排
+2. 繁简转换修改文本内容 → 触发重新渲染
+3. 缺少 GPU 层合成 → CPU 软件渲染慢
+
+**解决方案**：
+- Java 层：`setLayerType(LAYER_TYPE_HARDWARE)` + 高优先级渲染
+- CSS 层：`transform: translateZ(0)` + `contain: layout style paint`
+- 逻辑层：降低广告拦截频率至 5 秒
 
 ## 保持不变
 
