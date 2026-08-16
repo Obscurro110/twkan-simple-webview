@@ -234,7 +234,8 @@
     // Re-injection (a new page load in the same WebView) must not stack another
     // interval on top of the previous one.
     if (adBlockerTimer !== null) window.clearInterval(adBlockerTimer);
-    adBlockerTimer = window.setInterval(runAdCleanupPass, 2000);
+    // Reduce frequency from 2s to 5s to minimize layout thrashing during scroll
+    adBlockerTimer = window.setInterval(runAdCleanupPass, 5000);
   }
 
   // ─── Constants ────────────────────────────────────────────────────────────
@@ -2069,6 +2070,10 @@
     'iframe[src*="googlesyndication"] { display: none !important; }',
     '[class*="banner"] { display: none !important; }',
     '[id*="banner"] { display: none !important; }',
+    /* Smooth scrolling optimizations - force GPU compositing */
+    'html, body { -webkit-transform: translateZ(0); transform: translateZ(0); -webkit-backface-visibility: hidden; backface-visibility: hidden; }',
+    '[data-twkan-reading-chapter="true"] { will-change: auto; -webkit-transform: translateZ(0); transform: translateZ(0); contain: layout style paint; }',
+    '.twkan-appended-chapter-body { will-change: auto; contain: layout style paint; }',
     '.twkan-infinite-host { display: block !important; width: 100% !important; clear: both !important; }',
     'html[data-twkan-reader-bg], body[data-twkan-reader-bg] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
     '[data-twkan-reader-surface="true"] { background-color: var(--twkan-reader-background) !important; color: var(--twkan-reader-foreground) !important; }',
