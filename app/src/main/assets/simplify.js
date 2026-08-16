@@ -228,6 +228,20 @@
     hideTrailingDistractions();
   }
 
+  // ─── Scroll detection to pause operations during scrolling ─────────────────
+  var isScrolling = false;
+  var scrollTimer = null;
+  
+  function handleScroll() {
+    isScrolling = true;
+    if (scrollTimer !== null) {
+      window.clearTimeout(scrollTimer);
+    }
+    scrollTimer = window.setTimeout(function() {
+      isScrolling = false;
+    }, 150); // Resume 150ms after scroll stops
+  }
+
   function initAdBlocker() {
     installExternalLinkGuard();
     runAdCleanupPass();
@@ -235,7 +249,15 @@
     // interval on top of the previous one.
     if (adBlockerTimer !== null) window.clearInterval(adBlockerTimer);
     // Reduce frequency from 2s to 5s to minimize layout thrashing during scroll
-    adBlockerTimer = window.setInterval(runAdCleanupPass, 5000);
+    adBlockerTimer = window.setInterval(function() {
+      if (!isScrolling) {
+        runAdCleanupPass();
+      }
+    }, 5000);
+    
+    // Listen for scroll events to pause operations
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('touchmove', handleScroll, { passive: true });
   }
 
   // ─── Constants ────────────────────────────────────────────────────────────
@@ -2026,6 +2048,8 @@
   // ─── MutationObserver (subsequent updates, not first pass) ────────────────
   var observer = new MutationObserver(function (mutations) {
     if (converting) return;
+    // Skip processing during active scrolling to prevent layout thrashing
+    if (isScrolling) return;
     if (stopInfiniteReaderOnLibraryPage()) {
       renderAppReadingHistory();
       return;
