@@ -410,8 +410,13 @@
 
   // ─── Infinite Chapter Reader + conservative memory prefetch ────────────────
   var PREFETCH_AHEAD = 0;
-  var AUTO_APPEND_ROOT_MARGIN_PX = 900;
-  var AUTO_APPEND_MIN_INTERVAL_MS = 3000;
+  var AUTO_APPEND_ROOT_MARGIN_PX = 300;        // Trigger only when truly near bottom
+  var AUTO_APPEND_MIN_INTERVAL_MS = 3000;      // Base interval: 3s
+  var AUTO_APPEND_MAX_INTERVAL_MS = 8000;      // Max adaptive interval: 8s
+  var AUTO_APPEND_INTERVAL_INCREMENT_MS = 500; // Increase by 500ms per success
+  var CLOUDFLARE_RETRY_DELAY_MS = 2500;        // First retry after challenge: 2.5s
+  var CLOUDFLARE_RETRY_DELAY_2_MS = 1500;      // Second retry: 1.5s
+  var POST_VERIFICATION_BUFFER_MS = 1000;      // Wait 1s after visible verification
   var RATE_LIMIT_DEFAULT_RETRY_MS = 30 * 1000;
   var RATE_LIMIT_MAX_RETRY_MS = 5 * 60 * 1000;
   var chapterCache = Object.create(null);
@@ -435,6 +440,9 @@
   var cloudflareBlockedAt = 0;
   var rateLimitedUrl = null;
   var rateLimitedUntil = 0;
+  var currentAppendInterval = AUTO_APPEND_MIN_INTERVAL_MS;  // Adaptive throttling
+  var consecutiveSuccessfulAppends = 0;
+  var lastVerificationCompletedAt = 0;  // Track when visible verification finished
 
   function cancelScheduledAutomaticAppend() {
     if (automaticAppendTimer !== null) {
@@ -1351,12 +1359,14 @@
       }
     } catch (e) { /* visible navigation still works without the bridge */ }
     setLoadingState("正在打开下一章，请在当前页面完成网站验证…", false);
+    lastVerificationCompletedAt = Date.now();  // Mark verification time
     window.location.href = url;
   }
 
   /** Fetch and parse once; never run challenge scripts in a hidden context. */
-  function fetchChapter(url) {
+  function fetchChapter(url, retryCount) {
     url = normalizeUrl(url);
+    retryCount = retryCount || 0;
     if (!url) return Promise.reject(new Error("Invalid chapter URL"));
     if (chapterCache[url]) return Promise.resolve(chapterCache[url]);
     if (chapterRequests[url]) return chapterRequests[url];
@@ -1370,7 +1380,10 @@
     var htmlPromise = fetch(url, {
       credentials: "include",
       cache: "default",
-      redirect: "follow"
+      redirect: "follow",
+      headers: {
+        "Referer": currentReadingUrl || window.location.href
+      }
     }).then(function (response) {
       if (response.status === 429) {
         noteRateLimited(url, response);
@@ -1399,6 +1412,15 @@
       })
       .catch(function (error) {
         delete chapterRequests[url];
+        // Smart retry on Cloudflare challenge
+        if (isCloudflareError(error) && retryCount < 2) {
+          var retryDelay = retryCount === 0 ? CLOUDFLARE_RETRY_DELAY_MS : CLOUDFLARE_RETRY_DELAY_2_MS;
+          return new Promise(function (resolve) {
+            setTimeout(function () {
+              resolve(fetchChapter(url, retryCount + 1));
+            }, retryDelay);
+          });
+        }
         throw error;
       });
     return chapterRequests[url];
@@ -1541,6 +1563,18 @@
       queueAutomaticAppend();
       return Promise.resolve(null);
     }
+
+    // Wait if user just completed visible verification
+    if (allowVisibleNavigation !== true && lastVerificationCompletedAt > 0) {
+      var timeSinceVerification = Date.now() - lastVerificationCompletedAt;
+      if (timeSinceVerification < POST_VERIFICATION_BUFFER_MS) {
+        var remainingBuffer = POST_VERIFICATION_BUFFER_MS - timeSinceVerification;
+        nextAutomaticAppendAt = Date.now() + remainingBuffer;
+        queueAutomaticAppend();
+        return Promise.resolve(null);
+      }
+    }
+
     var requestedUrl = normalizeUrl(nextChapterUrl);
     if (!requestedUrl || appendedUrls[requestedUrl]) {
       noMoreChapters = true;
@@ -1558,7 +1592,7 @@
 
     appendingChapter = true;
     if (allowVisibleNavigation !== true) {
-      nextAutomaticAppendAt = Date.now() + AUTO_APPEND_MIN_INTERVAL_MS;
+      nextAutomaticAppendAt = Date.now() + currentAppendInterval;
     }
     setLoadingState("正在加载下一章…", false);
 
@@ -1598,6 +1632,15 @@
         nextChapterUrl = chapter.nextUrl;
         appendingChapter = false;
 
+        // Adaptive throttling: increase interval on success
+        consecutiveSuccessfulAppends++;
+        if (consecutiveSuccessfulAppends >= 2 && currentAppendInterval < AUTO_APPEND_MAX_INTERVAL_MS) {
+          currentAppendInterval = Math.min(
+            AUTO_APPEND_MAX_INTERVAL_MS,
+            currentAppendInterval + AUTO_APPEND_INTERVAL_INCREMENT_MS
+          );
+        }
+
         if (!nextChapterUrl || appendedUrls[nextChapterUrl]) {
           noMoreChapters = true;
           setLoadingState("已到最后一章", false);
@@ -1613,8 +1656,15 @@
       })
       .catch(function (error) {
         appendingChapter = false;
+
+        // Reset adaptive throttling on error
+        consecutiveSuccessfulAppends = 0;
+        currentAppendInterval = AUTO_APPEND_MIN_INTERVAL_MS;
+
         if (isCloudflareError(error)) {
           setCloudflareBlocked(requestedUrl);
+          // Add buffer after challenge to let verification settle
+          nextAutomaticAppendAt = Date.now() + 5000;
           setLoadingState("网站要求验证，点这里打开下一章", true);
         } else if (isRateLimitError(error)) {
           setLoadingState(rateLimitMessage(), true);
