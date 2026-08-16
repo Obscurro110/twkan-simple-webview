@@ -308,6 +308,14 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setMediaPlaybackRequiresUserGesture(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        
+        // Enable hardware acceleration for smooth scrolling
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        
+        // Additional rendering optimizations
+        settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        settings.setEnableSmoothTransition(true);
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
